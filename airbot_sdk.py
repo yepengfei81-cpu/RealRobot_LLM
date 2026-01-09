@@ -19,6 +19,8 @@ import time
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
+import datetime
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -254,7 +256,7 @@ class MMK2RealRobot():
         """相机迭代器类"""
         def __init__(self, mmk2_handler):
             self.mmk2 = mmk2_handler
-            self._init_camera()
+            self._init_camera()  # 初始化相机服务
             self.image_goal = {
                 MMK2Components.HEAD_CAMERA: [
                     ImageTypes.COLOR,
@@ -263,30 +265,39 @@ class MMK2RealRobot():
                 MMK2Components.LEFT_CAMERA: [ImageTypes.COLOR],
                 MMK2Components.RIGHT_CAMERA: [ImageTypes.COLOR],
             }
-            time.sleep(5)  # 等待相机初始化
+            print("等待相机初始化...")
+            time.sleep(5)  # 等待相机初始化完成
+            print("相机初始化完成")
             
         def _init_camera(self):
             """初始化相机硬件"""
+            print("正在启动相机服务...")
             result = self.mmk2.enable_resources({
                 MMK2Components.HEAD_CAMERA: {
-                    "serial_no": "'233522076556'",
-                    "rgb_camera.color_profile": "1280,720,15",
+                    "serial_no": "'242322078139'",
+                    "rgb_camera.color_profile": "640,480,30",
                     "enable_depth": "true",
                     "depth_module.depth_profile": "640,480,15",
                     "align_depth.enable": "true",
                 },
                 MMK2Components.LEFT_CAMERA: {
-                    "serial_no": "'327122077893'",
-                    "rgb_camera.color_profile": "1280,720,15",
-                    "enable_depth": "false",
+                    "camera_type": "USB",
+                    "video_device": "/dev/video8",
+                    "image_width": "640",
+                    "image_height": "480",
+                    "framerate": "25",
                 },
                 MMK2Components.RIGHT_CAMERA: {
-                    "serial_no": "'327122076989'",
-                    "rgb_camera.color_profile": "1280,720,15",
-                    "enable_depth": "false",
-                },
+                    "camera_type": "USB",
+                    "video_device": "/dev/video0",
+                    "image_width": "640",
+                    "image_height": "480",
+                    "framerate": "25",
+                },                
             })
-            assert MMK2Components.OTHER not in result, f"Camera init failed: {result[MMK2Components.OTHER]}"
+            print(f"相机服务启动结果: {result}")
+            if MMK2Components.OTHER in result:
+                print(f"警告: 相机初始化可能有问题: {result[MMK2Components.OTHER]}")
         
         def __iter__(self):
             return self
@@ -302,11 +313,14 @@ class MMK2RealRobot():
 
             for comp, images in comp_images.items():
                 for img_type, img in images.data.items():
-                    if img.shape[0] == 1:
+                    # 检查图像是否有效
+                    if img is None or len(img.shape) < 2:
                         continue
+                    if img.shape[0] <= 1 or img.shape[1] <= 1:
+                        continue
+                    
                     if comp == MMK2Components.HEAD_CAMERA:
                         if img_type == ImageTypes.COLOR:
-                            # img_head = cv2.resize(img, (1280, 720))
                             img_head = img
                         elif img_type == ImageTypes.ALIGNED_DEPTH_TO_COLOR:
                             img_depth = cv2.resize(img, (1280, 720))
@@ -316,6 +330,7 @@ class MMK2RealRobot():
                         img_right = cv2.resize(img, (1280, 720))
             
             return img_head, img_depth, img_left, img_right
+
 
     def set_robot_eef(self, eef_type, value):
         """设置机械臂末端执行器状态 0为开 1为关"""
@@ -800,14 +815,16 @@ if __name__ == "__main__":
     np.set_printoptions(precision=3, suppress=True, linewidth=500)
 
     # mmk2 = MMK2RealRobot()
-    mmk2 = MMK2RealRobot(ip="172.25.15.162")
-    mmk2.reset_start("right_arm")
-    mmk2.reset_start("left_arm")
+    # mmk2 = MMK2RealRobot(ip="172.25.15.162")
+    mmk2 = MMK2RealRobot(ip="192.168.11.200")
+    mmk2.show_head_camera(show_depth=True)
+    # mmk2.reset_start("right_arm")
+    # mmk2.reset_start("left_arm")
     # mmk2.set_robot_head_pose(yaw=0, pitch=-1.08)
     # mmk2.set_robot_head_pose(yaw=0, pitch=0.16)
-    mmk2.set_robot_head_pose(yaw=0, pitch=0)
+    # mmk2.set_robot_head_pose(yaw=0, pitch=0)
     # mmk2.reset_stop()
     # mmk2.set_move_base_zero()
-    mmk2.printMessage()
+    # mmk2.printMessage()
 
     
