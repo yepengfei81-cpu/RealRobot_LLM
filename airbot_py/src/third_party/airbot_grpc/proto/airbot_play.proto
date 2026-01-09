@@ -1,0 +1,140 @@
+syntax = "proto3";
+import "airbot_grpc/common.proto";
+
+package airbot_play;
+
+service AirbotPlayService {
+  rpc CreateRobot(airbot.Header) returns (airbot.ParamList) {}
+  rpc LaunchRobot(airbot.Header) returns (airbot.ParamList) {}
+  rpc CalibrateRobot(airbot.Header) returns (airbot.GoalStatus) {}
+  rpc CalibrateConfirm(airbot.Header) returns (airbot.GoalStatus) {}
+  rpc ShutdownRobot(airbot.Header) returns (airbot.GoalStatus) {}
+  rpc IAP(airbot.Header) returns (airbot.GoalStatus) {}
+  rpc MoveToPosition(MoveToPositionRequest) returns (airbot.GoalStatus) {}
+  rpc MoveServo(stream MoveServoParams) returns (airbot.GoalStatus) {}
+  rpc GetRobotState(airbot.Header) returns (stream RobotState) {}
+  rpc SetRobotMode(SetRobotModeRequest) returns (airbot.GoalStatus) {}
+  rpc GetSystemParams(airbot.GetSystemParamRequest) returns (airbot.ParamList) {
+  }
+  rpc TriggerLog(airbot.TriggerLogRequest) returns (airbot.GoalStatus) {
+  }
+}
+
+
+message ArmTarget {
+  airbot.FrameType target_frame = 1;
+  airbot.Pose target_pose = 2;
+  repeated double target_joint_value = 3;
+}
+
+message GripperTarget {
+  repeated double target_position = 1;
+  repeated double target_effort = 2;
+}
+
+message ArmWayPoint {
+  ArmTarget arm_target = 1;
+  GripperTarget gripper_target = 2;
+  double speed_scale = 3;
+  double acc_scale = 4;
+  double duration = 5;
+  double blend_radius = 6;
+  enum InterpolateMethod {
+    JOINT = 0;
+    CART = 1;
+  }
+  InterpolateMethod interpolate_method = 7;
+}
+
+message LoadData {
+  double mass = 1;
+  double com_x = 2;
+  double com_y = 3;
+  double com_z = 4;
+  double ixx = 5;
+  double ixy = 6;
+  double ixz = 7;
+  double iyy = 8;
+  double iyz = 9;
+  double izz = 10;
+}
+
+message ToolData {
+  string tool_name = 1;
+  airbot.Pose tool_frame = 2;
+  LoadData tool_load = 3;
+}
+
+message GripperState {
+  repeated double position = 1;
+  repeated double velocity = 2;
+  repeated double effort = 3;
+  repeated int32 error_code = 4;
+  repeated double temperature = 5;
+  string status = 6;
+}
+
+enum AirbotMode {
+  ONLINE_IDLE = 0;
+  ONLINE_SERVO = 1;
+  ONLINE_TRAJ = 2;
+  DEMONSTRATE_PREP = 10;
+  DEMONSTRATING = 11;
+  REPLAY_WAITING = 20;
+  REPLAY_REACHING = 21;
+  REPLAY_REACHED = 22;
+  REPLAYING = 23;
+  REPLAY_PAUSED = 24;
+  SLAVE_WAITING = 30;
+  SLAVE_REACHING = 31;
+  SLAVE_REACHED = 32;
+  SLAVE_MOVING = 33;
+  SLAVE_MOVING_ADJUST = 34;
+  LOW_LEVEL = 40;
+  APP_RUNNING = 50;
+  RECOVERY = 253;
+  ERROR = 254;
+  POWEROFF = 255;
+}
+
+message SetRobotModeRequest {
+  airbot.Header header = 1;
+  AirbotMode target_mode = 2;
+  int32 param = 3;
+}
+
+message MoveToPositionRequest {
+  airbot.Header header = 1;
+  repeated ArmWayPoint arm_waypoints = 2;
+  bool wait = 3;
+}
+
+message MoveServoParams {
+  enum ServoType {
+    JOINT_POSITION = 0;
+    JOINT_VELOCITY = 1;
+    CART_POSITION = 2;
+    CART_VELOCITY = 3;
+  }
+  enum ServoBackend {
+    FORWARD_POSITION = 0;
+    TRACKING = 1;
+  }
+  airbot.Header header = 1;
+  ServoType servo_type = 2;
+  ServoBackend servo_backend = 3;
+  ArmTarget servo_arm_target = 4;
+  GripperTarget servo_gripper_target = 5;
+}
+
+message RobotState {
+  bool is_valid = 1;
+  airbot.Time stamp = 2;
+  string current_tool_name = 3;
+  string current_task_id = 4;
+  airbot.JointState joint_states = 5;
+  GripperState gripper_states = 6;
+  airbot.Pose eef_pose = 7;
+  AirbotMode current_state = 8;
+  string current_error_msg = 9;
+}

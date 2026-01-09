@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package airbot;
+
+enum JogType {
+  JOINT = 0;
+  CART_BASE = 1;
+  CART_TOOL = 2;
+}
+
+enum FrameType {
+  BASE = 0;
+  TOOL = 1;
+  USER_DEFINED = 2;
+}
+
+message Time {
+  int32 sec = 1;
+  uint32 nanosec = 2;
+}
+
+message Position {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Orientation {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+message Pose {
+  Position position = 1;
+  Orientation orientation = 2;
+  string pose_link = 3;
+  string reference_link = 4;
+}
+
+message Pose3D {
+  double x = 1;
+  double y = 2;
+  double theta = 3;
+}
+
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Twist {
+  Vector3 linear = 1;
+  Vector3 angular = 2;
+  string twist_link = 3;
+  string reference_link = 4;
+}
+
+message Twist3D {
+  double x = 1;
+  double y = 2;
+  double omega = 3;
+}
+
+message JointState {
+  Header header = 1;
+  repeated string name = 2;
+  repeated double position = 3;
+  repeated double velocity = 4;
+  repeated double effort = 5;
+  repeated int32 error_code = 6;
+  repeated double temperature = 7;
+}
+
+message ParamList { map<string, string> params = 1; }
+
+message NumpyArray {
+  bytes data = 1;           // To hold the serialized NumPy array
+  repeated int32 shape = 2; // To hold the shape of the array
+  string dtype = 3;         // Data type of the array (e.g., 'float64')
+}
+
+message Image {
+  map<string, NumpyArray> data = 1;
+  Time stamp = 2;
+}
+
+message Empty {}
+
+message Header {
+  Time stamp = 1;
+  string caller_id = 2;
+}
+
+message GetSystemParamRequest {
+  Header header = 1;
+  repeated string param_names = 2;
+}
+
+message GoalStatus {
+  enum Status {
+    SUCCESS = 0;
+    INVALID_TARGET = 1;
+    INVALID_PARAM = 2;
+    INVALID_MODE = 3;
+    NEAR_SINGULARITY = 4;
+    COLLISION = 5;
+    TIMEOUT = 6;
+    UNKNOWN = 7;
+  }
+  Time stamp = 1;
+  Status value = 2;
+  string message = 3;
+}
+
+message TriggerLogRequest {
+  Header header = 1;
+}

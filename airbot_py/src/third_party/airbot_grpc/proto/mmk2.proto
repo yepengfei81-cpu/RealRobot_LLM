@@ -1,0 +1,190 @@
+syntax = "proto3";
+
+import "airbot_grpc/common.proto";
+import "airbot_grpc/airbot_play.proto";
+
+package mmk2;
+
+service MMK2Service {
+  rpc get_status(GetStatusRequest) returns (RobotStatus) {}
+  rpc enable_resources(EnableResourcesRequest) returns (Resources) {}
+  rpc create_robot(airbot.ParamList) returns (airbot.ParamList) {}
+  rpc set_goal(SetGoalRequest) returns (airbot.GoalStatus) {}
+  rpc get_robot_state(airbot.Header) returns (stream RobotState) {}
+  rpc get_image_once(GetImageRequest) returns (GetImageResponse) {}
+  rpc get_image_stream(GetImageRequest) returns (stream GetImageResponse) {}
+  rpc stop_stream(StopStreamRequest) returns (airbot.Empty) {}
+  rpc listen_to(ListenToRequest) returns (stream ListenToResponse) {}
+}
+
+message Resources { map<string, airbot.ParamList> data = 1; }
+
+// Robot State Types
+
+message RobotPose { map<string, airbot.Pose> robot_pose = 1; }
+
+message BaseState {
+  airbot.Time stamp = 1;
+  airbot.JointState joint_state = 2;
+  airbot.Pose3D pose = 3;
+  airbot.Twist3D velocity = 4;
+}
+
+message RobotState {
+  airbot.Time stamp = 1;
+  airbot.JointState joint_state = 2;
+  RobotPose robot_pose = 3;
+  BaseState base_state = 4;
+}
+
+// Motion Control Goals
+
+message Goal {
+  airbot.Pose pose = 3;
+  airbot.Pose3D pose3d = 4;
+  airbot.JointState joint_state = 5;
+  string str = 6;
+  airbot.Twist twist = 7;
+  airbot.Twist3D twist3d = 8;
+  double scalar = 9;
+}
+
+message GoalRepeated {
+  repeated airbot.Pose pose = 1;
+  repeated airbot.Pose3D pose3d = 2;
+  repeated airbot.JointState joint_state = 3;
+  repeated string str = 4;
+  repeated airbot.Twist twist = 5;
+  repeated airbot.Twist3D twist3d = 6;
+  repeated double scalar = 7;
+}
+
+// Motion Control Parameters
+
+message RecordParams {
+  float duration = 1; // Recording
+  float frequency = 2;
+  string mode = 3;
+  bool stop = 4;
+}
+
+message ReplayParams {
+  bool loop = 1;
+  double frequency = 2;
+  bool wait = 3;
+  bool stop = 4;
+}
+
+message TrajectoryParams {
+  airbot.JointState start_state = 1;
+  repeated string planning_pipelines = 2;
+  double max_velocity_scaling_factor = 3;
+  double max_acceleration_scaling_factor = 4;
+  double allowed_start_tolerance = 5;
+  double allowed_goal_duration_margin = 6;
+  double allowed_goal_duration_scaling = 7;
+  string interpolate_space = 8;
+  bool wait = 9;
+}
+
+message ForwardPositionParams { double max_velocity = 1; }
+
+message TrackingParams {
+  double max_velocity = 1;
+  double max_error = 2;
+}
+
+message BaseControlParams {
+  float max_linear_speed = 1;
+  float max_angular_speed = 2;
+  bool wait = 3;
+  bool backward = 4;
+  int32 navigation_mode = 5;
+  repeated string move_params = 6;
+  float speed_ratio = 7;
+  int32 fail_retry_count = 8;
+}
+
+message BuildMapParams {
+  bool move_to_origin = 1;
+  bool stop = 2;
+}
+
+message BaseChargeStationParams {
+  int32 navigation_mode = 1;
+  bool move_to_dock = 2;
+}
+
+message Param {
+  TrajectoryParams trajectory = 1;
+  airbot_play.MoveServoParams servo = 2;
+  ForwardPositionParams forward_position = 3;
+  RecordParams record = 4;
+  ReplayParams replay = 5;
+  BaseControlParams base_control = 6;
+  BuildMapParams build_map = 7;
+  BaseChargeStationParams base_charge = 8;
+  TrackingParams tracking = 9;
+}
+
+// Request and Response Types
+
+message GetImageRequest {
+  airbot.Header header = 1;
+  repeated string components = 2;
+  repeated string image_types = 3;
+}
+
+message GetImageResponse { map<string, airbot.Image> images = 1; }
+
+message StopStreamRequest {
+  airbot.Header header = 1;
+  repeated StreamCall stream_calls = 2;
+}
+
+message GoalRequest {
+  Goal goal = 1;
+  GoalRepeated goal_repeated = 2;
+  Param param = 3;
+}
+
+message SetGoalRequest {
+  airbot.Header header = 1;
+  map<string, GoalRequest> goals_map = 2;
+}
+
+enum StreamCall {
+  GET_ROBOT_STATE = 0;
+  GET_IMAGE = 1;
+}
+
+message ListenToRequest {
+  airbot.Header header = 1;
+  repeated string name = 2;
+  bool enable = 3;
+}
+
+message ArrayStamped {
+  airbot.Time stamp = 1;
+  repeated double data = 2;
+}
+
+message ListenToResponse {
+  map<string, airbot.JointState> joint_state = 1;
+  map<string, ArrayStamped> array_stamped = 2;
+}
+
+message GetStatusRequest {
+  airbot.Header header = 1;
+  string component = 2;
+}
+
+message RobotStatus {
+  airbot.Header header = 1;
+  map<string, airbot.ParamList> status = 2;
+}
+
+message EnableResourcesRequest {
+  airbot.Header header = 1;
+  Resources resources = 2;
+}

@@ -1,0 +1,8 @@
+[submodule "src/third_party/airbot_grpc"]
+	path = src/third_party/airbot_grpc
+	url = ssh://git@git.qiuzhi.tech:20002/airbot-play/airbot-grpc.git
+	branch = main
+[submodule "src/third_party/mmk2_types"]
+	path = src/third_party/mmk2_types
+	url = ssh://git@git.qiuzhi.tech:20002/mmk2/mmk2_types.git
+	branch = main

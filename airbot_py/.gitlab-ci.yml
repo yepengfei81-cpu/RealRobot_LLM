@@ -1,0 +1,162 @@
+default:
+  image: registry.qiuzhi.tech/mirror/library/python:3.12
+  tags:
+    - linux/amd64
+
+stages:
+  - test
+  - build
+  - deploy
+
+style-test:
+  retry: 2
+  stage: test
+  before_script:
+    - pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple/
+    - pip install clang-format==19.1.6
+    - pip install pre-commit==4.0.1
+    - pre-commit install
+  script:
+    - pre-commit run --all-files
+
+unit-test:
+  retry: 2
+  stage: test
+  before_script:
+    - pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest transforms3d pynput
+    - pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .[test]
+  script:
+    - pytest
+  artifacts:
+    paths:
+      - coverage.xml
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    when: always
+
+linting:
+  retry: 2
+  stage: test
+  before_script:
+    - pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pylint-gitlab transforms3d pynput
+  script:
+    - pylint --fail-under=8 --load-plugins=pylint_gitlab --output-format=text,gitlab-codeclimate:codeclimate.json "**/*.py"
+  artifacts:
+    paths:
+      - codeclimate.json
+    reports:
+      codequality: codeclimate.json
+    when: always
+
+wheel-x86_64:
+  retry: 2
+  stage: build
+  needs:
+    - job: unit-test
+      artifacts: false
+    - job: linting
+      artifacts: false
+    - job: style-test
+      artifacts: false
+  tags:
+    - linux/amd64
+  before_script:
+    - pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages build grpcio-tools grpcio transforms3d pynput
+    - mkdir -p /root/.ssh
+    - cp $SSH_PRIV_KEY /root/.ssh/id_ed25519 && chmod 600 /root/.ssh/id_ed25519
+    - cp $SSH_PUB_KEY /root/.ssh/id_ed25519.pub && chmod 644 /root/.ssh/id_ed25519.pub
+    - ssh-keyscan -p 20002 -t ed25519 git.qiuzhi.tech > /root/.ssh/known_hosts
+    - GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519' git submodule update --init --recursive
+    - cd src/airbot_py && bash ./grpc_generate.sh && cd ../..
+    - cd src/third_party && pip install ./mmk2_types && cd ../..
+  script:
+    - python -m build
+  artifacts:
+    paths:
+      - dist/
+      - /root/.ssh/
+
+# wheel-aarch64:
+#   stage: build
+#   tags:
+#     - linux/arm64
+#   before_script:
+#     - pip install -i https://pypi.tuna.tsinghua.edu.cn/simple build
+#   script:
+#     - python -m build
+#   artifacts:
+#     paths:
+#       - dist/
+
+pages-build:
+  retry: 2
+  stage: build
+  before_script:
+    - pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .[doc]
+  script:
+    - cd docs/
+    - mkdocs build --strict --verbose --site-dir public
+  artifacts:
+    paths:
+      - docs/public
+
+pypi:
+  retry: 2
+  stage: deploy
+  needs:
+    - job: wheel-x86_64
+      artifacts: true
+  variables:
+    TWINE_USERNAME: gitlab-ci-token
+    TWINE_PASSWORD: $CI_JOB_TOKEN
+  script:
+    - pip install -i https://pypi.tuna.tsinghua.edu.cn/simple twine
+    - python -m twine upload --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/* --verbose
+    - export  PACKAGE_NAME=$(ls dist | grep .wheel)
+    - |
+      curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file dist/*.whl ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/wheel/${CI_COMMIT_REF_NAME}/${PACKAGE_NAME}
+  rules:
+    - if: $CI_COMMIT_TAG
+  artifacts:
+    paths:
+      - dist
+    expire_in: 2 weeks
+
+pages:
+  retry: 2
+  stage: deploy
+  needs:
+    - job: pages-build
+      artifacts: true
+  before_script:
+    - apt-get update && apt-get install -y curl zip
+  script:
+    - mv docs/public .
+    - zip -r docs.zip public/
+    - |
+      curl --location --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+           --upload-file docs.zip \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/docs/${CI_COMMIT_REF_NAME}/docs.zip"
+  artifacts:
+    paths:
+      - public
+      - docs.zip
+  publish: public
+  rules:
+    - if: $CI_COMMIT_TAG
+
+release:
+  retry: 2
+  stage: deploy
+  needs:
+    - job: pypi
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - export PACKAGE_NAME=$(ls dist | grep .whl)
+    - |
+      release-cli create --name "Release ${CI_COMMIT_TAG}" --tag-name ${CI_COMMIT_TAG} --ref ${CI_COMMIT_TAG} --assets-link "{\"name\":\"${PACKAGE_NAME}\",\"url\":\"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/wheel/${CI_COMMIT_REF_NAME}/${PACKAGE_NAME}\"}" \"link_type\":\"package\"
