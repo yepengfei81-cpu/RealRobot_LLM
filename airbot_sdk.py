@@ -236,6 +236,45 @@ class MMK2RealRobot:
         ):
             logger.error("Failed to set goal")
 
+    # ========== 夹爪控制 ==========
+    def set_gripper(self, left_pos=None, right_pos=None):
+        """
+        控制左右夹爪开合
+        Args:
+            left_pos: 左夹爪位置 (0.0=闭合, 1.0=张开), None表示不控制
+            right_pos: 右夹爪位置 (0.0=闭合, 1.0=张开), None表示不控制
+        """
+        gripper_action = {}
+        if left_pos is not None:
+            gripper_action[MMK2Components.LEFT_ARM_EEF] = JointState(position=[left_pos])
+        if right_pos is not None:
+            gripper_action[MMK2Components.RIGHT_ARM_EEF] = JointState(position=[right_pos])
+        
+        if not gripper_action:
+            logger.warning("未指定任何夹爪位置")
+            return False
+        
+        if (
+            self.mmk2.set_goal(gripper_action, TrajectoryParams()).value
+            != GoalStatus.Status.SUCCESS
+        ):
+            logger.error("Failed to set gripper")
+            return False
+        logger.info(f"夹爪设置: left={left_pos}, right={right_pos}")
+        return True
+
+    def open_gripper(self, left=True, right=True):
+        """张开夹爪"""
+        left_pos = 1.0 if left else None
+        right_pos = 1.0 if right else None
+        return self.set_gripper(left_pos, right_pos)
+
+    def close_gripper(self, left=True, right=True):
+        """闭合夹爪"""
+        left_pos = 0.0 if left else None
+        right_pos = 0.0 if right else None
+        return self.set_gripper(left_pos, right_pos)
+    
     def control_move_base_velocity(self, linear_x=0.0, angular_z=0.0):
         """控制底盘速度"""
         if (
@@ -261,7 +300,8 @@ if __name__ == "__main__":
     mmk2 = MMK2RealRobot(ip="192.168.11.200")
     
     # 测试头部控制
-    mmk2.set_robot_head_pose(0, -1.08)
+    mmk2.set_robot_head_pose(0, 0)
+    mmk2.open_gripper()
     
     # 测试获取机器人状态
     state = mmk2.get_robot_state()

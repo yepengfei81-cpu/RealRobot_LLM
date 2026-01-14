@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="mmk2">
+  <xacro:arg name="prefix" default=""/>
+  <xacro:arg name="left_arm" default="play_short"/>
+  <xacro:arg name="left_arm_eef" default="G2"/>
+  <xacro:arg name="left_camera" default="none"/>
+  <xacro:arg name="left_camera_connector" default="none"/>
+  <xacro:arg name="right_arm" default="play_short"/>
+  <xacro:arg name="right_arm_eef" default="G2"/>
+  <xacro:arg name="right_camera" default="none"/>
+  <xacro:arg name="right_camera_connector" default="none"/>
+  <xacro:arg name="spine" default="/dev/spine"/>
+  <xacro:arg name="head" default="yaw_pitch"/>
+
+  <xacro:property name="prefix" value="$(arg prefix)"/>
+  <xacro:property name="left_arm" value="$(arg left_arm)"/>
+  <xacro:property name="left_arm_eef" value="$(arg left_arm_eef)"/>
+  <xacro:property name="left_camera" value="$(arg left_camera)"/>
+  <xacro:property name="left_camera_connector" value="$(arg left_camera_connector)"/>
+  <xacro:property name="right_arm" value="$(arg right_arm)"/>
+  <xacro:property name="right_arm_eef" value="$(arg right_arm_eef)"/>
+  <xacro:property name="right_camera" value="$(arg right_camera)"/>
+  <xacro:property name="right_camera_connector" value="$(arg right_camera_connector)"/>
+  <xacro:property name="spine" value="$(arg spine)"/>
+  <xacro:property name="head" value="$(arg head)"/>
+
+  <!-- include all parts -->
+  <xacro:include filename="$(find mmk2_description)/urdf/robots/slamtec_athena.xacro"/>
+  <xacro:slamtec_athena prefix=""/>
+
+  <xacro:if value="${head != 'none'}">
+    <xacro:include filename="$(find mmk2_description)/urdf/modules/head_joint.ros2_control.xacro"/>
+    <xacro:head_ros2_control name="head_yaw_control" joint_name="head_yaw_joint" use_can_interface="true" can_interface="can_head" motor_id="1"/>
+    <xacro:head_ros2_control name="head_pitch_control" joint_name="head_pitch_joint" use_can_interface="true" can_interface="can_head" motor_id="2"/>
+  </xacro:if>
+
+  <xacro:if value="${spine != 'none'}">
+    <xacro:include filename="$(find mmk2_description)/urdf/modules/spine.ros2_control.xacro"/>
+    <xacro:slide_ros2_control name="slide_linear_control" prefix="" serial_port_name="${spine}" baud_rate="115200" slave_id="1" use_serial="true"/>
+  </xacro:if>
+
+  <xacro:include filename="$(find airbot_description)/urdf/airbot_play_generic.xacro"/>
+  <xacro:airbot_play_generic prefix="left_arm_" can_interface="can_left" arm_type="${left_arm}" eef_type="${left_arm_eef}" camera_type="${left_camera}" camera_connector_type="${left_camera_connector}" eef_prefix="eef_"/>
+  <xacro:airbot_play_generic prefix="right_arm_" can_interface="can_right" arm_type="${right_arm}" eef_type="${right_arm_eef}" camera_type="${right_camera}" camera_connector_type="${right_camera_connector}" eef_prefix="eef_"/>
+
+  <!-- To solve the warning: The root link base_link has an inertia specified in the URDF, but KDL does not support a root link with an inertia.  As a workaround, you can add an extra dummy link to your URDF.  -->
+  <link name="world" />
+  <!-- TODO: if joint type is floating, [kdl_parser]: Converting unknown joint type of joint 'fixed_base' into a fixed joint. [moveit_2580797882.moveit.ros.current_state_monitor] Unable to update multi-DOF joint 'fixed_base':Failure to lookup transform between 'world'and 'base_link' with TF exception: "world" passed to lookupTransform argument target_frame does not exist. The complete state of the robot is not yet known.  Missing fixed_base  -->
+  <joint name="fixed_base" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="world" />
+    <child link="base_link" />
+  </joint>
+
+  <!-- Connect the arms to the slide -->
+  <joint name="left_arm_fixed_joint" type="fixed">
+    <origin xyz="0.10174 0.02283 0.09475" rpy="1.57079633 0 2.356194490192345"/>
+    <parent link="slide_link" />
+    <child link="left_arm_base_link" />
+  </joint>
+
+  <joint name="right_arm_fixed_joint" type="fixed">
+    <origin xyz="-0.10174 0.02283 0.09475" rpy="-1.57079633 0 0.7853981633974483"/>
+    <parent link="slide_link" />
+    <child link="right_arm_base_link" />
+  </joint>
+
+  <!-- Slide and Head -->
+  <link name="slide_link">
+    <inertial>
+      <origin xyz="-7.90494393625066E-05 0.067355217450789 0.10519083626064" rpy="0 0 0" />
+      <mass value="2.87043102920673" />
+      <inertia ixx="0.00899755064402379" ixy="6.09937870252811E-07" ixz="2.90775161414524E-06" iyy="0.0119634133355932" iyz="-0.000250919444280722" izz="0.00864817587777869" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://mmk2_description/meshes/mmk2/visual/slide_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://mmk2_description/meshes/mmk2/collision/slide_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="slide_joint" type="prismatic">
+    <origin xyz="0.033942 -0.00025 1.406" rpy="3.1416 0 1.5708" />
+    <parent link="base_link" />
+    <child link="slide_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.04" upper="0.87" effort="5" velocity="0.3" />
+  </joint>
+  <link name="head_yaw_link">
+    <inertial>
+      <origin xyz="0.0118490941462296 0.000491254783341499 0.0390231494943873" rpy="0 0 0" />
+      <mass value="0.263127360420809" />
+      <inertia  ixx="0.000185798854547827" ixy="2.64309797822853E-07" ixz="-2.93582511724902E-05" iyy="0.000173833362201622" iyz="-2.8054841555532E-06" izz="9.38655776831082E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://mmk2_description/meshes/mmk2/visual/head_yaw_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://mmk2_description/meshes/mmk2/collision/head_yaw_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="head_yaw_joint" type="revolute">
+    <origin xyz="0 0.1735 0.07242" rpy="3.1416 0 0" />
+    <parent link="slide_link" />
+    <child link="head_yaw_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.5" upper="0.5" effort="0" velocity="0" />
+  </joint>
+  <link name="head_pitch_link">
+    <inertial>
+      <origin xyz="0.0244659096221799 -0.108421751901101 -0.00311687659834824" rpy="0 0 0" />
+      <mass value="0.500765947013434" />
+      <inertia ixx="0.00157924187002826" ixy="2.16781765858799E-05" ixz="-1.02638171835218E-06" iyy="0.000804096450222595" iyz="1.48815549401623E-05" izz="0.00113048749298996" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="3.1415 0 0" />
+      <geometry>
+        <mesh filename="package://mmk2_description/meshes/mmk2/visual/head_pitch_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="3.1415 0 0" />
+      <geometry>
+        <mesh filename="package://mmk2_description/meshes/mmk2/collision/head_pitch_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="head_pitch_joint" type="revolute">
+    <origin xyz="0.00099952 3.1059E-05 0.058" rpy="1.5708 0.0 -1.5708" />
+    <parent link="head_yaw_link" />
+    <child link="head_pitch_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.1" upper="0.3" effort="0" velocity="0" />
+  </joint>
+  <joint name="camera_fixed_joint" type="fixed">
+    <origin xyz="0.0755 0.1855 -0.035" rpy="3.1416 -1.5708 -0.33"/>
+    <parent link="head_pitch_link" />
+    <child link="head_camera_link" />
+  </joint>
+  <link name="head_camera_link" />
+
+</robot>
