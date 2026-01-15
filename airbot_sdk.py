@@ -17,6 +17,7 @@ import logging
 import time
 import cv2
 import numpy as np
+from typing import Optional, Dict, List, Tuple
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -99,6 +100,9 @@ class MMK2RealRobot:
                     "enable_depth": "true",
                     "depth_module.depth_profile": "640,480,15",
                     "align_depth.enable": "true",
+                    "rgb_camera.enable_auto_exposure": "false",
+                    "rgb_camera.exposure": "215",
+                    "rgb_camera.gain": "64",
                 },
                 MMK2Components.LEFT_CAMERA: {
                     "camera_type": "USB",
@@ -150,12 +154,56 @@ class MMK2RealRobot:
             
             return img_head, img_depth, img_left, img_right
 
-    # ========== 以下来自 airbot_mmk2_examples.py ==========
-    
     def get_robot_state(self):
         """获取机器人状态"""
         return self.mmk2.get_robot_state()
 
+    def get_joint_positions(self) -> Optional[Tuple[List[str], List[float]]]:
+        """
+        获取所有电机的名称和位置
+        
+        Returns:
+            tuple: (names, positions) 或 None
+        """
+        try:
+            state = self.mmk2.get_robot_state()
+            if state is None:
+                return None
+            js = state.joint_state
+            return list(js.name), list(js.position)
+        except Exception as e:
+            logger.error(f"获取关节位置失败: {e}")
+            return None
+
+    def get_arm_end_poses(self) -> Optional[Dict[str, Dict]]:
+        """
+        获取左右机械臂的末端位姿
+        
+        Returns:
+            dict: {'left_arm': {'position': [x,y,z], 'orientation': [x,y,z,w]}, 
+                   'right_arm': {...}}
+        """
+        try:
+            state = self.mmk2.get_robot_state()
+            if state is None or state.robot_pose is None:
+                return None
+            
+            result = {}
+            for name, pose in state.robot_pose.robot_pose.items():
+                pose_data = {
+                    'position': [pose.position.x, pose.position.y, pose.position.z],
+                    'orientation': [pose.orientation.x, pose.orientation.y, 
+                                   pose.orientation.z, pose.orientation.w],
+                }
+                if 'left' in name.lower():
+                    result['left_arm'] = pose_data
+                elif 'right' in name.lower():
+                    result['right_arm'] = pose_data
+            return result if result else None
+        except Exception as e:
+            logger.error(f"获取末端位姿失败: {e}")
+            return None
+                
     def control_trajectory_full(self, joint_action=None):
         """全关节轨迹控制"""
         if joint_action is None:
@@ -236,7 +284,6 @@ class MMK2RealRobot:
         ):
             logger.error("Failed to set goal")
 
-    # ========== 夹爪控制 ==========
     def set_gripper(self, left_pos=None, right_pos=None):
         """
         控制左右夹爪开合
@@ -300,9 +347,13 @@ if __name__ == "__main__":
     mmk2 = MMK2RealRobot(ip="192.168.11.200")
     
     # 测试头部控制
-    mmk2.set_robot_head_pose(0, 0)
+    # mmk2.set_robot_head_pose(0, 0)
     mmk2.open_gripper()
-    
+    mmk2.reset_to_start()
+    poses = mmk2.get_arm_end_poses()
+    print(f"左臂位置: {poses['left_arm']['position']}")
+    print(f"右臂位置: {poses['right_arm']['position']}")
+
     # 测试获取机器人状态
     state = mmk2.get_robot_state()
     if state:
