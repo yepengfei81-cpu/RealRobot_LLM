@@ -127,17 +127,30 @@ class MMK2RealRobot:
             self._set_usb_camera_exposure()
         
         def _set_usb_camera_exposure(self):
-            """设置 USB 相机手动曝光"""
+            """设置 USB 相机手动曝光（通过 SSH 在下位机执行）"""
             import subprocess
-            for cam in ["/dev/left_camera", "/dev/right_camera"]:
-                try:
-                    subprocess.run(["v4l2-ctl", "-d", cam, "--set-ctrl=auto_exposure=1"], 
-                                   capture_output=True, timeout=2)
-                    subprocess.run(["v4l2-ctl", "-d", cam, "--set-ctrl=exposure_time_absolute=10"], 
-                                   capture_output=True, timeout=2)
-                    print(f"[相机] {cam} 曝光已设置")
-                except Exception as e:
-                    print(f"[相机] {cam} 曝光设置失败: {e}")
+            
+            remote_host = "orangepi@192.168.11.200"
+            password = "airbot"
+            
+            for cam in ["left_camera", "right_camera"]:
+                cmds = [
+                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=auto_exposure=1",
+                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=brightness=-50",
+                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=backlight_compensation=0",
+                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=exposure_time_absolute=30",
+                ]
+                for cmd in cmds:
+                    try:
+                        ssh_cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no {remote_host} '{cmd}'"
+                        result = subprocess.run(ssh_cmd, shell=True, capture_output=True, timeout=10)
+                        if result.returncode != 0:
+                            print(f"[相机] 命令失败: {cmd}, 错误: {result.stderr.decode()}")
+                    except subprocess.TimeoutExpired:
+                        print(f"[相机] {cam} 命令超时: {cmd}")
+                    except Exception as e:
+                        print(f"[相机] {cam} 设置失败: {e}")
+            print("[相机] USB 相机曝光设置完成")
         
         def __iter__(self):
             return self
@@ -174,6 +187,55 @@ class MMK2RealRobot:
         """获取机器人状态"""
         return self.mmk2.get_robot_state()
 
+    def get_joint_efforts(self) -> Optional[Dict[str, float]]:
+        """
+        获取所有关节的力矩/电流
+        
+        Returns:
+            dict: {关节名称: 力矩值} 或 None
+        """
+        try:
+            state = self.mmk2.get_robot_state()
+            if state is None:
+                return None
+            js = state.joint_state
+            names = list(js.name)
+            efforts = list(js.effort) if js.effort else []
+            
+            if not efforts:
+                logger.warning("effort 字段为空")
+                return None
+            
+            return {name: effort for name, effort in zip(names, efforts)}
+        except Exception as e:
+            logger.error(f"获取关节力矩失败: {e}")
+            return None
+
+    def get_gripper_effort(self, left=True) -> Optional[float]:
+        """
+        获取夹爪电机的力矩/电流
+        
+        Args:
+            left: True 获取左夹爪，False 获取右夹爪
+            
+        Returns:
+            float: 力矩值 或 None
+        """
+        efforts = self.get_joint_efforts()
+        if efforts is None:
+            return None
+        
+        # 查找夹爪关节（根据实际关节名称调整）
+        target_keywords = ['left', 'eef'] if left else ['right', 'eef']
+        for name, effort in efforts.items():
+            name_lower = name.lower()
+            if all(kw in name_lower for kw in target_keywords):
+                return effort
+        
+        # 如果没找到，打印所有关节名供调试
+        logger.warning(f"未找到夹爪关节，所有关节: {list(efforts.keys())}")
+        return None
+    
     def get_joint_positions(self) -> Optional[Tuple[List[str], List[float]]]:
         """
         获取所有电机的名称和位置
