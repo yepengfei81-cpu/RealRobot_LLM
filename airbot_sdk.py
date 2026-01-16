@@ -101,7 +101,7 @@ class MMK2RealRobot:
                     "depth_module.depth_profile": "640,480,15",
                     "align_depth.enable": "true",
                     "rgb_camera.enable_auto_exposure": "false",
-                    "rgb_camera.exposure": "215",
+                    "rgb_camera.exposure": "230",
                     "rgb_camera.gain": "64",
                 },
                 MMK2Components.LEFT_CAMERA: {
@@ -122,6 +122,22 @@ class MMK2RealRobot:
             print(f"相机服务启动结果: {result}")
             if MMK2Components.OTHER in result:
                 print(f"警告: 相机初始化可能有问题: {result[MMK2Components.OTHER]}")
+            
+            # 调整 USB 相机曝光
+            self._set_usb_camera_exposure()
+        
+        def _set_usb_camera_exposure(self):
+            """设置 USB 相机手动曝光"""
+            import subprocess
+            for cam in ["/dev/left_camera", "/dev/right_camera"]:
+                try:
+                    subprocess.run(["v4l2-ctl", "-d", cam, "--set-ctrl=auto_exposure=1"], 
+                                   capture_output=True, timeout=2)
+                    subprocess.run(["v4l2-ctl", "-d", cam, "--set-ctrl=exposure_time_absolute=10"], 
+                                   capture_output=True, timeout=2)
+                    print(f"[相机] {cam} 曝光已设置")
+                except Exception as e:
+                    print(f"[相机] {cam} 曝光设置失败: {e}")
         
         def __iter__(self):
             return self
@@ -309,7 +325,28 @@ class MMK2RealRobot:
             return False
         logger.info(f"夹爪设置: left={left_pos}, right={right_pos}")
         return True
-
+    
+    def set_spine(self, position: float = 0.0) -> bool:
+        """
+        控制脊柱升降
+        Args:
+            position: 脊柱位置（弧度），0.0 为初始位置
+            正数向下，负数向上，升降范围（-0.1,1.0）
+        Returns:
+            bool: 是否成功
+        """
+        spine_action = {
+            MMK2Components.SPINE: JointState(position=[position]),
+        }
+        if (
+            self.mmk2.set_goal(spine_action, TrajectoryParams()).value
+            != GoalStatus.Status.SUCCESS
+        ):
+            logger.error("Failed to set spine position")
+            return False
+        logger.info(f"脊柱位置设置: {position:.3f}")
+        return True
+    
     def open_gripper(self, left=True, right=True):
         """张开夹爪"""
         left_pos = 1.0 if left else None
