@@ -8,6 +8,10 @@
 """
 
 import sys
+from pathlib import Path
+
+# Add parent directory to path for importing local modules
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, "/home/ypf/sam3-main")
 
 import cv2
