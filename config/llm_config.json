@@ -1,0 +1,47 @@
+{
+  "llm": {
+    "enabled": true,
+    "client": "openai",
+    "model": "qwen-plus-2025-12-01",
+    "temperature": 0.0,
+    "api_key": "sk-a1b0fd7f25054e008406d3c9cf71ddf9",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "timeout": 15.0,
+    "max_retries": 2
+  },
+
+  "robot": {
+    "dof": 6,
+    "gripper_max_opening": 0.08
+  },
+
+  "brick": {
+    "size_LWH": [0.11, 0.05, 0.025],
+    "mass": 0.4
+  },
+
+  "grasp": {
+    "hover_height": 0.15,
+    "safety_clearance": 0.05,
+    "grasp_effort_threshold": 2.0
+  },
+
+  "place": {
+    "target_position": [0.54, -0.04, 1.00],
+    "target_yaw": 0.0,
+    "y_offset": -0.08
+  },
+
+  "timing": {
+    "move_wait_sec": 1.5,
+    "gripper_close_wait_sec": 0.8,
+    "gripper_open_wait_sec": 0.5,
+    "settle_sec": 0.3
+  },
+
+  "debug": {
+    "verbose": true,
+    "print_llm_prompt": false,
+    "print_llm_response": true
+  }
+}
