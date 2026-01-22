@@ -1,12 +1,16 @@
 """
-LLM-based Brick Grasp Program (Simplified Version)
+LLM-based Brick Grasp Program (Step-by-Step Version)
 
-This is a simplified version that only implements:
-1. Head camera detection (SAM3)
-2. LLM planning for pre-grasp position
-3. Move arm to hover above brick
+Current implementation:
+1. Head camera detection (SAM3) → Get brick position
+2. LLM pre-grasp planning → Move to hover position
+3. Hand-eye camera fine positioning → Refine brick position (geometric)
+4. LLM descend planning → Get descent position and gripper gap
+5. Open gripper and descend to grasp position
 
-Flow: Head Detection -> LLM Planning -> Move Above Brick
+NOT YET IMPLEMENTED:
+- Close gripper and grasp
+- Lift and place
 
 Keys:
   Space - Start task
@@ -85,13 +89,9 @@ class SAM3Segmenter:
             return masks
 
 
-# ==================== Position Calculator ====================
+# ==================== Position Calculators ====================
 def estimate_orientation(mask: np.ndarray) -> float:
-    """
-    Estimate orientation angle (yaw) from mask.
-    
-    Returns yaw in radians, normalized to [-pi/2, pi/2] with safety checks.
-    """
+    """Estimate orientation angle (yaw) from mask."""
     contours, _ = cv2.findContours(
         (mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -104,21 +104,15 @@ def estimate_orientation(mask: np.ndarray) -> float:
     
     rect = cv2.minAreaRect(largest)
     (_, _), (w, h), angle = rect
-    
-    # Determine long axis angle
     long_angle = angle + 90 if w < h else angle
     yaw = -np.radians(long_angle)
     
-    # Normalize to [-pi/2, pi/2] with protection
     while yaw > np.pi / 2:
         yaw -= np.pi
     while yaw < -np.pi / 2:
         yaw += np.pi
     
-    # Safety clamp
-    yaw = np.clip(yaw, -np.pi / 2, np.pi / 2)
-    
-    return float(yaw)
+    return float(np.clip(yaw, -np.pi / 2, np.pi / 2))
 
 
 class HeadCameraCalculator:
@@ -128,7 +122,6 @@ class HeadCameraCalculator:
         self.fx, self.fy = HEAD_INTRINSICS['fx'], HEAD_INTRINSICS['fy']
         self.cx, self.cy = HEAD_INTRINSICS['cx'], HEAD_INTRINSICS['cy']
         
-        # Load extrinsic offset compensation
         self.offset = np.zeros(3)
         offset_path = CALIB_DIR / "head_camera_offset.json"
         if offset_path.exists():
@@ -138,11 +131,7 @@ class HeadCameraCalculator:
                 print(f"[Head Camera] Static offset: {self.offset}")
     
     def compute(self, mask: np.ndarray, depth: np.ndarray, tf_matrix: np.ndarray) -> Optional[Dict]:
-        """
-        Compute brick position in base_link frame.
-        
-        Returns dict with 'position' (np.ndarray) and 'yaw' (float), or None on failure.
-        """
+        """Compute brick position in base_link frame."""
         h, w = depth.shape
         mask = mask[0] if len(mask.shape) == 3 else mask
         if mask.shape != (h, w):
@@ -152,12 +141,10 @@ class HeadCameraCalculator:
         if not np.any(mask_bool):
             return None
         
-        # Pixel center
         ys, xs = np.where(mask_bool)
         px, py = np.mean(xs), np.mean(ys)
         yaw_cam = estimate_orientation(mask_bool)
         
-        # Depth calculation (median after erosion for robustness)
         kernel = np.ones((5, 5), np.uint8)
         eroded = cv2.erode(mask_bool.astype(np.uint8), kernel, iterations=2)
         valid = depth[eroded > 0] if np.any(eroded) else depth[mask_bool]
@@ -165,12 +152,8 @@ class HeadCameraCalculator:
         if len(valid) == 0:
             return None
         
-        z = np.median(valid) / 1000.0  # Convert mm to m
-        
-        # Sanity check on depth
-        if z < 0.1 or z > 2.0:
-            print(f"[Head Camera] Warning: Unusual depth {z:.3f}m, clamping")
-            z = np.clip(z, 0.1, 2.0)
+        z = np.median(valid) / 1000.0
+        z = np.clip(z, 0.1, 2.0)
         
         pos_cam = np.array([
             (px - self.cx) * z / self.fx,
@@ -178,11 +161,9 @@ class HeadCameraCalculator:
             z
         ])
         
-        # Transform to base_link
         pos_base = (tf_matrix @ np.append(pos_cam, 1))[:3] + self.offset
         yaw_base = yaw_cam + np.arctan2(tf_matrix[1, 0], tf_matrix[0, 0]) + np.pi
         
-        # Normalize yaw to [-pi, pi]
         while yaw_base > np.pi:
             yaw_base -= 2 * np.pi
         while yaw_base < -np.pi:
@@ -191,15 +172,73 @@ class HeadCameraCalculator:
         return {'position': pos_base, 'yaw': yaw_base}
 
 
+class HandEyeCalculator:
+    """Hand-Eye Camera Position Calculator (Geometric)"""
+    
+    def __init__(self, intrinsics: dict, extrinsics: dict):
+        self.fx, self.fy = intrinsics['fx'], intrinsics['fy']
+        self.cx, self.cy = intrinsics['cx'], intrinsics['cy']
+        
+        self.T_cam2gripper = np.eye(4)
+        self.T_cam2gripper[:3, :3] = np.array(extrinsics['rotation_matrix'])
+        self.T_cam2gripper[:3, 3] = np.array(extrinsics['translation'])
+    
+    def compute(self, mask: np.ndarray, shape: Tuple[int, int], 
+                R_g2b: np.ndarray, t_g2b: np.ndarray,
+                reference_z: float, reference_yaw: float) -> Optional[Dict]:
+        """Compute brick position using geometric calculation (no LLM)."""
+        h, w = shape
+        mask = mask[0] if len(mask.shape) == 3 else mask
+        if mask.shape != (h, w):
+            mask = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+        
+        mask_bool = mask > 0.5
+        if not np.any(mask_bool):
+            return None
+        
+        ys, xs = np.where(mask_bool)
+        px, py = np.mean(xs), np.mean(ys)
+        yaw_cam = estimate_orientation(mask_bool)
+        
+        T_g2b = np.eye(4)
+        T_g2b[:3, :3], T_g2b[:3, 3] = R_g2b, t_g2b.flatten()
+        T_cam2base = T_g2b @ self.T_cam2gripper
+        
+        R_mat = T_cam2base[:3, :3]
+        t_vec = T_cam2base[:3, 3]
+        nx = (px - self.cx) / self.fx
+        ny = (py - self.cy) / self.fy
+        coeff = R_mat[2, 0] * nx + R_mat[2, 1] * ny + R_mat[2, 2]
+        z_cam = (reference_z - t_vec[2]) / coeff if abs(coeff) > 1e-6 else 0.3
+        z_cam = max(0.05, min(1.0, z_cam))
+        
+        pos_cam = np.array([(px - self.cx) * z_cam / self.fx, (py - self.cy) * z_cam / self.fy, z_cam])
+        pos_base = (T_cam2base @ np.append(pos_cam, 1))[:3]
+        yaw_base = yaw_cam + np.arctan2(T_cam2base[1, 0], T_cam2base[0, 0])
+        
+        while yaw_base > np.pi:
+            yaw_base -= 2 * np.pi
+        while yaw_base < -np.pi:
+            yaw_base += 2 * np.pi
+        
+        # Fix yaw jump
+        diff = yaw_base - reference_yaw
+        while diff > np.pi:
+            diff -= 2 * np.pi
+        while diff < -np.pi:
+            diff += 2 * np.pi
+        if abs(diff) > np.pi / 2:
+            yaw_base = yaw_base - np.pi if yaw_base > 0 else yaw_base + np.pi
+        
+        return {'position': pos_base, 'yaw': yaw_base}
+
+
 # ==================== LLM Grasp Controller ====================
 class LLMGraspController:
     """
-    LLM-based Brick Grasp Controller (Simplified Version)
+    LLM-based Brick Grasp Controller (Step-by-Step Version)
     
-    Only implements:
-    1. Head camera detection
-    2. LLM pre-grasp planning
-    3. Move to hover position
+    Current implementation stops at descend position.
     """
     
     def __init__(
@@ -222,13 +261,23 @@ class LLMGraspController:
         print(f"[Init] Connecting to robot {ip}...")
         self.robot = MMK2RealRobot(ip=ip)
         self.robot.set_robot_head_pose(0, -1.08)
-        self.robot.set_spine(0.15)
+        self.robot.set_spine(0.08)
         
         # Initialize segmenter
         self.segmenter = SAM3Segmenter(checkpoint)
         
-        # Initialize head camera calculator
+        # Initialize calculators
         self.head_calc = HeadCameraCalculator()
+        
+        # Load hand-eye calibration
+        side = "left" if use_left else "right"
+        intr_path = CALIB_DIR / f"hand_eye_intrinsics_{side}.json"
+        extr_path = CALIB_DIR / f"hand_eye_extrinsics_{side}.json"
+        with open(intr_path) as f:
+            intr = json.load(f)
+        with open(extr_path) as f:
+            extr = json.load(f)
+        self.handeye_calc = HandEyeCalculator(intr, extr)
         
         # Initialize TF client
         self.tf_client = TFClient(host=tf_host, port=tf_port, auto_connect=True)
@@ -238,90 +287,92 @@ class LLMGraspController:
             config_path = str(CONFIG_DIR / "llm_config.json")
         self.llm_planner = create_grasp_planner(config_path)
         
+        # Load config for gripper conversion
+        with open(config_path) as f:
+            config = json.load(f)
+        self.gripper_max_opening = config.get("gripper", {}).get("max_opening", 0.08)
+        
         # Thread control
         self._task_thread: Optional[threading.Thread] = None
         self._abort = threading.Event()
         self._task_running = threading.Event()
         
-        # Shared state (thread-safe)
+        # Shared state
         self._state_lock = threading.Lock()
         self._current_step = ""
         self._task_success = False
         self._last_head_result: Optional[Dict] = None
+        self._last_handeye_result: Optional[Dict] = None
         self._last_llm_result: Optional[Dict] = None
         
-        # Latest frame cache
+        # Frame cache
         self._frame_lock = threading.Lock()
         self._latest_rgb: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
         
-        print("[Init] Initialization complete")
+        print("[Init] Complete")
         print("=" * 60)
-        print("LLM Grasp Controller - Simplified Version")
+        print("LLM Grasp Controller (Step-by-Step)")
         print("=" * 60)
-        print("Key Instructions:")
-        print("  Space - Start LLM grasp task")
-        print("  r     - Abort and return to initial position")
-        print("  q/Esc - Exit program")
+        print("  Space - Start task (hover → fine → descend)")
+        print("  r     - Abort / Reset")
+        print("  q/Esc - Exit")
         print("=" * 60)
     
-    # ==================== Thread-safe State Management ====================
+    # ==================== State Management ====================
     
     def _set_step(self, step: str):
-        """Set current step (thread-safe)"""
         with self._state_lock:
             self._current_step = step
         print(step)
     
     def _get_step(self) -> str:
-        """Get current step (thread-safe)"""
         with self._state_lock:
             return self._current_step
     
     def _set_head_result(self, result: Optional[Dict]):
-        """Set head detection result (thread-safe)"""
         with self._state_lock:
             self._last_head_result = result
     
     def _get_head_result(self) -> Optional[Dict]:
-        """Get head detection result (thread-safe)"""
         with self._state_lock:
             if self._last_head_result is None:
                 return None
-            return {
-                'position': self._last_head_result['position'].copy(),
-                'yaw': self._last_head_result['yaw']
-            }
+            return {'position': self._last_head_result['position'].copy(), 'yaw': self._last_head_result['yaw']}
+    
+    def _set_handeye_result(self, result: Optional[Dict]):
+        with self._state_lock:
+            self._last_handeye_result = result
+    
+    def _get_handeye_result(self) -> Optional[Dict]:
+        with self._state_lock:
+            if self._last_handeye_result is None:
+                return None
+            return {'position': self._last_handeye_result['position'].copy(), 'yaw': self._last_handeye_result['yaw']}
     
     def _set_llm_result(self, result: Optional[Dict]):
-        """Set LLM planning result (thread-safe)"""
         with self._state_lock:
             self._last_llm_result = result
     
     def _get_llm_result(self) -> Optional[Dict]:
-        """Get LLM planning result (thread-safe)"""
         with self._state_lock:
             return self._last_llm_result.copy() if self._last_llm_result else None
     
     def _get_latest_frame(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Get latest frame (thread-safe)"""
         with self._frame_lock:
             rgb = self._latest_rgb.copy() if self._latest_rgb is not None else None
             depth = self._latest_depth.copy() if self._latest_depth is not None else None
             return rgb, depth
     
     def _update_frame(self, rgb: np.ndarray, depth: np.ndarray):
-        """Update latest frame (thread-safe)"""
         with self._frame_lock:
             self._latest_rgb = rgb.copy()
             self._latest_depth = depth.copy() if depth is not None else None
     
     def _check_abort(self) -> bool:
-        """Check if task should be aborted"""
         return self._abort.is_set()
     
     def _wait_with_abort_check(self, duration: float) -> bool:
-        """Wait for specified duration, checking abort signal. Returns False if aborted"""
         interval = 0.05
         elapsed = 0.0
         while elapsed < duration:
@@ -334,7 +385,6 @@ class LLMGraspController:
     # ==================== Robot Control ====================
     
     def _compute_grasp_orientation(self, yaw: float) -> Tuple[float, float, float, float]:
-        """Compute grasp pose quaternion (gripper pointing down)"""
         r_base = R.from_euler('y', np.pi / 2)
         r_yaw = R.from_euler('z', yaw)
         r_final = r_yaw * r_base
@@ -342,11 +392,6 @@ class LLMGraspController:
         return float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
     
     def _move_arm(self, position: List[float], yaw: float, wait: float = 2.0) -> bool:
-        """
-        Move arm to specified position.
-        
-        Returns False if aborted or failed.
-        """
         if self._check_abort():
             return False
         
@@ -365,27 +410,39 @@ class LLMGraspController:
             print(f"[Error] Move failed: {e}")
             return False
     
+    def _open_gripper_to_gap(self, gap: float) -> bool:
+        """Open gripper to specified gap width."""
+        if self._check_abort():
+            return False
+        
+        position = min(1.0, gap / self.gripper_max_opening)
+        
+        try:
+            eef_component = MMK2Components.LEFT_ARM_EEF if self.use_left else MMK2Components.RIGHT_ARM_EEF
+            action = {eef_component: JointState(position=[position])}
+            self.robot.mmk2.set_goal(action, TrajectoryParams())
+            return self._wait_with_abort_check(0.5)
+        except Exception as e:
+            print(f"[Error] Gripper open failed: {e}")
+            return False
+    
     def _reset_position(self):
-        """Return to initial position"""
         self._set_step("[Reset] Returning to initial position...")
         arm_action = {
             MMK2Components.LEFT_ARM: JointState(position=[0.0, 0.0, 0.324, 0.0, 0.724, 0.0]),
             MMK2Components.RIGHT_ARM: JointState(position=[0.0, 0.0, 0.324, 0.0, -0.724, 0.0]),
             MMK2Components.LEFT_ARM_EEF: JointState(position=[1.0]),
             MMK2Components.RIGHT_ARM_EEF: JointState(position=[1.0]),
-            MMK2Components.SPINE: JointState(position=[0.15]),
+            MMK2Components.SPINE: JointState(position=[0.08]),
         }
         try:
             result = self.robot.mmk2.set_goal(arm_action, TrajectoryParams())
             if result.value == GoalStatus.Status.SUCCESS:
                 print("[Reset] Complete")
-            else:
-                print(f"[Reset] Status: {result}")
         except Exception as e:
             print(f"[Reset] Exception: {e}")
     
     def _get_handeye_image(self) -> Optional[np.ndarray]:
-        """Get hand-eye camera image for display"""
         goal = {self.camera_component: [ImageTypes.COLOR]}
         for c, imgs in self.robot.mmk2.get_image(goal).items():
             if c == self.camera_component:
@@ -394,170 +451,332 @@ class LLMGraspController:
                         return cv2.resize(img, (640, 480))
         return None
     
+    def _get_arm_pose(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        poses = self.robot.get_arm_end_poses()
+        if poses and self.arm_key in poses:
+            p = poses[self.arm_key]
+            return R.from_quat(p['orientation']).as_matrix(), np.array(p['position'])
+        return None
+
+    def _close_gripper(self) -> bool:
+        """Close gripper and return success."""
+        if self._check_abort():
+            return False
+        try:
+            self.robot.close_gripper(left=self.use_left, right=not self.use_left)
+            return self._wait_with_abort_check(0.8)
+        except Exception as e:
+            print(f"[Error] Gripper close failed: {e}")
+            return False
+    
+    def _get_gripper_state(self) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Get gripper effort and gap.
+        
+        Returns:
+            (effort, gap) or (None, None) if failed
+        """
+        try:
+            # Get effort
+            effort = self.robot.get_gripper_effort(left=self.use_left)
+            
+            # Get gap from joint position
+            result = self.robot.get_joint_positions()
+            if result is None:
+                return effort, None
+            
+            names, positions = result
+            gap = None
+            target_keyword = 'left' if self.use_left else 'right'
+            for name, pos in zip(names, positions):
+                if target_keyword in name.lower() and 'eef' in name.lower():
+                    # Convert position (0-1) to gap (0 - max_opening)
+                    gap = pos * self.gripper_max_opening
+                    break
+            
+            return effort, gap
+        except Exception as e:
+            print(f"[Error] Get gripper state failed: {e}")
+            return None, None    
     # ==================== Task Execution ====================
     
-    def _execute_llm_grasp_task(self):
+    def _execute_task(self):
         """
-        Execute LLM-based grasp task (runs in worker thread).
+        Execute LLM-based grasp task with closed-loop feedback.
         
-        Simplified flow:
-        1. Head camera detection
-        2. LLM pre-grasp planning
-        3. Move to hover position
+        Flow:
+        1. Head camera detection → brick position
+        2. LLM pre-grasp planning → hover position
+        3. Hand-eye fine positioning → refined XY
+        4. LLM descend planning → initial grasp position
+        5. Closed-loop grasp with LLM feedback:
+           - Descend → Close gripper → Check sensors → LLM analysis
+           - If failed, adjust Z and retry (max 3 attempts)
         """
         self._task_success = False
+        max_grasp_attempts = 3
         
         print("\n" + "=" * 60)
-        print("[LLM Task Started] Press 'r' to abort anytime")
+        print("[Task Started] LLM Closed-Loop Grasp")
         print("=" * 60)
         
-        # ===== Step 1: Get current frame =====
+        # ===== Step 1: Head camera detection =====
         rgb, depth = self._get_latest_frame()
         if rgb is None or depth is None:
             self._set_step("[Failed] Cannot get camera frame")
             return
         
-        # ===== Step 2: Head camera detection =====
-        self._set_step("\n[Step 1/3] Head camera detecting brick...")
+        self._set_step("\n[Step 1/6] Head camera detection...")
         if self._check_abort():
             return
         
         tf_data = self.tf_client.get_transform('base_link', 'head_camera_link')
         if not tf_data:
-            self._set_step("[Failed] TF acquisition failed")
+            self._set_step("[Failed] TF failed")
             return
         
         masks = self.segmenter.segment(rgb, self.prompt)
         if self._check_abort():
             return
         if masks is None or len(masks) == 0:
-            self._set_step("[Failed] No brick detected by SAM3")
+            self._set_step("[Failed] No brick detected")
             return
         
         head_result = self.head_calc.compute(masks[0], depth, tf_data['matrix'])
         if head_result is None:
-            self._set_step("[Failed] Cannot compute brick position from depth")
+            self._set_step("[Failed] Position calculation failed")
             return
         
         self._set_head_result(head_result)
-        
         brick_pos = head_result['position']
         brick_yaw = head_result['yaw']
-        print(f"  Detected brick position: [{brick_pos[0]:.4f}, {brick_pos[1]:.4f}, {brick_pos[2]:.4f}] m")
-        print(f"  Detected brick yaw: {np.degrees(brick_yaw):.1f}°")
+        print(f"  Brick: [{brick_pos[0]:.4f}, {brick_pos[1]:.4f}, {brick_pos[2]:.4f}] m, yaw={np.degrees(brick_yaw):.1f}°")
         
-        # ===== Step 3: LLM pre-grasp planning =====
-        self._set_step("\n[Step 2/3] LLM planning pre-grasp position...")
+        # ===== Step 2: LLM pre-grasp planning =====
+        self._set_step("\n[Step 2/6] LLM pre-grasp planning...")
         if self._check_abort():
             return
-        
-        # Convert numpy array to list for LLM planner
-        brick_position_list = brick_pos.tolist() if hasattr(brick_pos, 'tolist') else list(brick_pos)
         
         success, llm_result, error = self.llm_planner.plan_pre_grasp(
-            brick_position=brick_position_list,
+            brick_position=brick_pos.tolist(),
             brick_yaw=float(brick_yaw),
         )
-        
-        if self._check_abort():
-            return
-        
         if not success:
-            self._set_step(f"[Failed] LLM planning failed: {error}")
+            self._set_step(f"[Failed] LLM planning: {error}")
             return
         
         self._set_llm_result(llm_result)
+        hover_pos = llm_result['target_position']
+        hover_yaw = llm_result['target_yaw']
         
-        target_pos = llm_result['target_position']
-        target_yaw = llm_result['target_yaw']
-        reasoning = llm_result.get('reasoning', 'N/A')
+        # ===== Step 3: Move to pre-grasp =====
+        self._set_step("\n[Step 3/6] Moving to hover position...")
+        if not self._move_arm(hover_pos, hover_yaw, wait=2.5):
+            return
+        print("  Reached hover position")
         
-        print(f"  LLM target position: [{target_pos[0]:.4f}, {target_pos[1]:.4f}, {target_pos[2]:.4f}] m")
-        print(f"  LLM target yaw: {np.degrees(target_yaw):.1f}°")
-        print(f"  LLM reasoning: {reasoning}")
-        
-        # ===== Step 4: Move to pre-grasp position =====
-        self._set_step("\n[Step 3/3] Moving to pre-grasp position...")
+        # ===== Step 4: Hand-eye fine positioning =====
+        self._set_step("\n[Step 4/6] Hand-eye fine positioning...")
         if self._check_abort():
             return
         
-        if not self._move_arm(target_pos, target_yaw, wait=2.5):
-            self._set_step("[Failed] Move to pre-grasp position failed or aborted")
+        handeye_img = self._get_handeye_image()
+        arm_pose = self._get_arm_pose()
+        if handeye_img is None or arm_pose is None:
+            self._set_step("[Failed] Cannot get hand-eye data")
             return
         
-        self._set_step("\n[Task Complete] Arm positioned above brick!")
-        print("=" * 60)
-        print("LLM-based pre-grasp positioning successful.")
-        print("Next steps (not implemented yet):")
-        print("  - Hand-eye fine positioning")
-        print("  - Descend and grasp")
-        print("  - Lift and place")
-        print("=" * 60)
-        self._task_success = True
+        masks = self.segmenter.segment(handeye_img, self.prompt)
+        if self._check_abort():
+            return
+        if masks is None or len(masks) == 0:
+            self._set_step("[Failed] Hand-eye detection failed")
+            return
+        
+        handeye_result = self.handeye_calc.compute(
+            masks[0], handeye_img.shape[:2], arm_pose[0], arm_pose[1],
+            reference_z=brick_pos[2], reference_yaw=brick_yaw
+        )
+        if handeye_result is None:
+            self._set_step("[Failed] Hand-eye calculation failed")
+            return
+        
+        self._set_handeye_result(handeye_result)
+        fine_pos = handeye_result['position']
+        fine_yaw = handeye_result['yaw']
+        print(f"  Refined: [{fine_pos[0]:.4f}, {fine_pos[1]:.4f}, {fine_pos[2]:.4f}] m, yaw={np.degrees(fine_yaw):.1f}°")
+        
+        # Fine XY alignment (keep current Z)
+        current_pose = self._get_arm_pose()
+        if current_pose is None:
+            return
+        align_pos = [fine_pos[0], fine_pos[1], current_pose[1][2]]
+        if not self._move_arm(align_pos, fine_yaw, wait=1.5):
+            return
+        print("  XY aligned")
+        
+        # ===== Step 5: Get initial grasp parameters from LLM =====
+        self._set_step("\n[Step 5/6] LLM descend planning...")
+        if self._check_abort():
+            return
+        
+        success, descend_result, error = self.llm_planner.plan_descend(
+            brick_position=fine_pos.tolist(),
+            brick_yaw=float(fine_yaw),
+        )
+        if not success:
+            self._set_step(f"[Failed] LLM descend: {error}")
+            return
+        
+        grasp_pos = list(descend_result['target_position'])
+        grasp_yaw = descend_result['target_yaw']
+        gripper_gap = descend_result['gripper_gap']
+        print(f"  Initial grasp pos: [{grasp_pos[0]:.4f}, {grasp_pos[1]:.4f}, {grasp_pos[2]:.4f}] m")
+        print(f"  Gripper gap: {gripper_gap:.4f} m")
+        
+        # ===== Step 6: Closed-loop grasp with LLM feedback =====
+        self._set_step("\n[Step 6/6] Closed-loop grasp...")
+        
+        for attempt in range(1, max_grasp_attempts + 1):
+            if self._check_abort():
+                return
+            
+            print(f"\n  --- Grasp Attempt {attempt}/{max_grasp_attempts} ---")
+            print(f"  Target Z: {grasp_pos[2]:.4f} m")
+            
+            # Open gripper
+            if not self._open_gripper_to_gap(gripper_gap):
+                return
+            
+            # Descend to grasp position
+            if not self._move_arm(grasp_pos, grasp_yaw, wait=2.0):
+                return
+            print(f"  Descended to grasp position")
+            
+            # Close gripper
+            if not self._close_gripper():
+                return
+            time.sleep(0.3)  # Wait for stable reading
+            
+            # Get sensor feedback
+            effort, gap = self._get_gripper_state()
+            if effort is None:
+                effort = 0.0
+            if gap is None:
+                gap = 0.0
+            
+            print(f"  Gripper effort: {effort:.3f} A")
+            print(f"  Gripper gap: {gap:.4f} m")
+            
+            # Get current TCP position
+            arm_pose = self._get_arm_pose()
+            tcp_pos = arm_pose[1].tolist() if arm_pose else grasp_pos
+            
+            # LLM analyze feedback
+            print(f"  Analyzing with LLM...")
+            success, feedback_result, error = self.llm_planner.analyze_grasp_feedback(
+                brick_position=grasp_pos,
+                brick_yaw=grasp_yaw,
+                tcp_position=tcp_pos,
+                gripper_effort=effort,
+                gripper_gap_after_close=gap,
+                attempt_number=attempt,
+                max_attempts=max_grasp_attempts,
+            )
+            
+            if not success:
+                print(f"  [Warning] LLM analysis failed: {error}")
+                # Fallback: simple threshold check
+                if effort > 2.0 and gap > 0.03:
+                    print("  [Fallback] Effort and gap indicate success")
+                    self._task_success = True
+                    break
+                continue
+            
+            # Check if grasp succeeded
+            if feedback_result['grasp_success']:
+                print(f"\n  ✓ GRASP SUCCESSFUL (confidence: {feedback_result['confidence']:.2f})")
+                self._task_success = True
+                break
+            
+            # Grasp failed - check if adjustment needed
+            adjustment = feedback_result['adjustment']
+            if not adjustment['needed']:
+                print(f"  ✗ Grasp failed but no adjustment suggested")
+                break
+            
+            if attempt >= max_grasp_attempts:
+                print(f"  ✗ Max attempts reached")
+                break
+            
+            # Apply Z adjustment
+            delta_z = adjustment['delta_z']
+            print(f"  Adjusting Z by {delta_z*1000:+.1f} mm ({adjustment['reason']})")
+            grasp_pos[2] += delta_z
+            
+            # Open gripper and move up before retry
+            if not self._open_gripper_to_gap(gripper_gap):
+                return
+            lift_pos = [grasp_pos[0], grasp_pos[1], grasp_pos[2] + 0.05]
+            if not self._move_arm(lift_pos, grasp_yaw, wait=1.0):
+                return
+        
+        # ===== Task Complete =====
+        if self._task_success:
+            self._set_step("\n[Task Complete] Brick grasped successfully!")
+            print("=" * 60)
+            print("Brick is now grasped. Ready for lift and place.")
+            print("=" * 60)
+        else:
+            self._set_step("\n[Task Failed] Could not grasp brick after retries")
     
     def _task_worker(self):
-        """Task worker thread"""
         try:
-            self._execute_llm_grasp_task()
+            self._execute_task()
         except Exception as e:
-            print(f"[Error] Task execution exception: {e}")
+            print(f"[Error] {e}")
             import traceback
             traceback.print_exc()
         finally:
-            # Reset position if failed or aborted
-            if not self._task_success or self._check_abort():
+            # 任务成功时不自动复位，让机械臂保持在抓取位置
+            if self._check_abort():
                 self._reset_position()
-                if self._check_abort():
-                    print("[Aborted] Task has been aborted by user")
-                else:
-                    print("[Hint] Task failed. Check brick visibility and try again.")
-            
             self._task_running.clear()
             self._set_step("")
     
     def _start_task(self):
-        """Start LLM grasp task"""
         if self._task_running.is_set():
-            print("[Warning] Task already in progress")
+            print("[Warning] Task running")
             return
         
         self._abort.clear()
         self._task_running.set()
         self._set_head_result(None)
+        self._set_handeye_result(None)
         self._set_llm_result(None)
         
         self._task_thread = threading.Thread(target=self._task_worker, daemon=True)
         self._task_thread.start()
     
     def _abort_task(self):
-        """Abort current task"""
         if self._task_running.is_set():
-            print("\n[Abort] Received abort signal, stopping...")
+            print("\n[Abort] Stopping...")
             self._abort.set()
         else:
-            # Not executing task, reset directly
             self._reset_position()
     
     # ==================== Display ====================
     
-    def _draw_detection(self, frame: np.ndarray, result: Optional[Dict], label: str, color: Tuple[int, int, int]) -> np.ndarray:
-        """Draw detection/planning result on image"""
-        out = frame.copy()
+    def _draw_info(self, frame: np.ndarray, result: Optional[Dict], label: str, y_offset: int, color: Tuple) -> np.ndarray:
         if result is None:
-            return out
-        
+            return frame
         pos = result.get('position', result.get('target_position', [0, 0, 0]))
         yaw = result.get('yaw', result.get('target_yaw', 0))
-        yaw_deg = np.degrees(yaw)
-        
-        text = f"{label} X:{pos[0]:.3f} Y:{pos[1]:.3f} Z:{pos[2]:.3f} Yaw:{yaw_deg:.1f}"
-        cv2.putText(out, text, (10, 60 if 'Head' in label else 90), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        return out
+        text = f"{label} [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] yaw={np.degrees(yaw):.1f}"
+        cv2.putText(frame, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        return frame
     
     def run(self):
-        """Main loop (display thread)"""
         cv2.namedWindow("Head Camera", cv2.WINDOW_NORMAL)
         cv2.namedWindow("HandEye Camera", cv2.WINDOW_NORMAL)
         
@@ -566,77 +785,51 @@ class LLMGraspController:
                 if rgb is None or rgb.size == 0:
                     continue
                 
-                # Update latest frame (for task thread)
                 self._update_frame(rgb, depth)
-                
-                # Display head camera image
                 disp = rgb.copy()
                 
-                # Status display
                 is_running = self._task_running.is_set()
-                current_step = self._get_step()
+                step = self._get_step()
                 
-                if is_running:
-                    status = f"[Running] {current_step[:50]}..." if len(current_step) > 50 else f"[Running] {current_step}"
-                    status_color = (0, 165, 255)  # Orange
-                else:
-                    status = "[Standby] Space=Start LLM Task, r=Reset, q=Quit"
-                    status_color = (0, 255, 0)  # Green
+                status = f"[Running] {step[:45]}..." if is_running else "[Ready] Space=Start, r=Reset, q=Quit"
+                color = (0, 165, 255) if is_running else (0, 255, 0)
+                cv2.putText(disp, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
-                cv2.putText(disp, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-                
-                # Draw head detection result
-                head_result = self._get_head_result()
-                if head_result:
-                    disp = self._draw_detection(disp, head_result, "Head:", (0, 255, 255))
-                
-                # Draw LLM planning result
-                llm_result = self._get_llm_result()
-                if llm_result:
-                    disp = self._draw_detection(disp, llm_result, "LLM:", (255, 0, 255))
+                disp = self._draw_info(disp, self._get_head_result(), "Head:", 60, (0, 255, 255))
+                disp = self._draw_info(disp, self._get_handeye_result(), "Fine:", 85, (255, 255, 0))
+                disp = self._draw_info(disp, self._get_llm_result(), "LLM:", 110, (255, 0, 255))
                 
                 cv2.imshow("Head Camera", disp)
                 
-                # Display hand-eye camera image
-                handeye_img = self._get_handeye_image()
-                if handeye_img is not None:
-                    he_disp = handeye_img.copy()
-                    cv2.putText(he_disp, "HandEye Camera", (10, 30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.imshow("HandEye Camera", he_disp)
+                he_img = self._get_handeye_image()
+                if he_img is not None:
+                    cv2.putText(he_img, "HandEye", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.imshow("HandEye Camera", he_img)
                 
-                # Key handling (non-blocking)
                 k = cv2.waitKey(1) & 0xFF
-                
-                if k == ord(' ') and not self._task_running.is_set():
+                if k == ord(' ') and not is_running:
                     self._start_task()
-                
                 elif k == ord('r'):
                     self._abort_task()
-                
-                elif k in (ord('q'), 27):  # q or ESC
-                    # Abort task before exit
-                    if self._task_running.is_set():
+                elif k in (ord('q'), 27):
+                    if is_running:
                         self._abort.set()
                         self._task_thread.join(timeout=3.0)
                     break
-        
         finally:
             cv2.destroyAllWindows()
             self.tf_client.disconnect()
 
 
-# ==================== Main ====================
-
 def main():
-    parser = argparse.ArgumentParser(description="LLM-based Brick Grasp Program")
-    parser.add_argument("--ip", default="192.168.11.200", help="Robot IP")
-    parser.add_argument("--prompt", default="block, brick, rectangular object", help="SAM3 detection prompt")
-    parser.add_argument("--checkpoint", default="/home/ypf/sam3-main/checkpoint/sam3.pt", help="SAM3 model path")
-    parser.add_argument("--tf-host", default="127.0.0.1", help="TF server address")
-    parser.add_argument("--tf-port", type=int, default=9999, help="TF server port")
-    parser.add_argument("--right-arm", action="store_true", help="Use right arm (default: left)")
-    parser.add_argument("--config", default=None, help="LLM config path (default: config/llm_config.json)")
+    parser = argparse.ArgumentParser(description="LLM Grasp Controller")
+    parser.add_argument("--ip", default="192.168.11.200")
+    parser.add_argument("--prompt", default="block, brick, rectangular object")
+    parser.add_argument("--checkpoint", default="/home/ypf/sam3-main/checkpoint/sam3.pt")
+    parser.add_argument("--tf-host", default="127.0.0.1")
+    parser.add_argument("--tf-port", type=int, default=9999)
+    parser.add_argument("--right-arm", action="store_true")
+    parser.add_argument("--config", default=None)
     args = parser.parse_args()
     
     controller = LLMGraspController(

@@ -12,7 +12,12 @@
 
   "robot": {
     "dof": 6,
-    "gripper_max_opening": 0.08
+    "gripper_max_opening": 0.07
+  },
+
+  "gripper": {
+    "max_opening": 0.07,
+    "clearance": 0.02
   },
 
   "brick": {

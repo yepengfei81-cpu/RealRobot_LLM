@@ -101,7 +101,7 @@ class MMK2RealRobot:
                     "depth_module.depth_profile": "640,480,15",
                     "align_depth.enable": "true",
                     "rgb_camera.enable_auto_exposure": "false",
-                    "rgb_camera.exposure": "230",
+                    "rgb_camera.exposure": "200",
                     "rgb_camera.gain": "64",
                 },
                 MMK2Components.LEFT_CAMERA: {
@@ -136,9 +136,9 @@ class MMK2RealRobot:
             for cam in ["left_camera", "right_camera"]:
                 cmds = [
                     f"v4l2-ctl -d /dev/{cam} --set-ctrl=auto_exposure=1",
-                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=brightness=-50",
+                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=brightness=-64",
                     f"v4l2-ctl -d /dev/{cam} --set-ctrl=backlight_compensation=0",
-                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=exposure_time_absolute=30",
+                    f"v4l2-ctl -d /dev/{cam} --set-ctrl=exposure_time_absolute=20",
                 ]
                 for cmd in cmds:
                     try:

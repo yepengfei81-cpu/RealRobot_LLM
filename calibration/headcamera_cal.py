@@ -316,7 +316,7 @@ def main():
     print("\n[初始化] 连接机器人...")
     robot = MMK2RealRobot(ip=args.ip)
     robot.set_robot_head_pose(0, -1.08)  # 头部朝下看
-    robot.set_spine(0.1)
+    robot.set_spine(0.08)
     
     print("[初始化] 连接 TF 服务...")
     tf_client = TFClient(host=args.tf_host, port=args.tf_port, auto_connect=True)

@@ -1,7 +1,5 @@
 """
 LLM Module for Real Robot Grasp Planning
-
-This module provides LLM-based planning capabilities for robotic grasping tasks.
 """
 
 from .llm_client import LLMClient, create_llm_client
@@ -11,6 +9,10 @@ from .prompts import (
     get_pre_grasp_prompt,
     PRE_GRASP_REPLY_TEMPLATE,
     build_pre_grasp_context,
+    get_descend_prompt,
+    build_descend_context,
+    get_grasp_feedback_prompt,
+    build_grasp_feedback_context,
 )
 
 __all__ = [
@@ -25,4 +27,8 @@ __all__ = [
     'get_pre_grasp_prompt', 
     'PRE_GRASP_REPLY_TEMPLATE',
     'build_pre_grasp_context',
+    'get_descend_prompt',
+    'build_descend_context',
+    'get_grasp_feedback_prompt',
+    'build_grasp_feedback_context',
 ]
