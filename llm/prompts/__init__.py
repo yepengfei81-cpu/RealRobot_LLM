@@ -20,6 +20,24 @@ from .grasp_prompt import (
     build_grasp_feedback_context,
 )
 
+from .lift_prompt import (
+    get_lift_prompt,
+    build_lift_context,
+    LIFT_REPLY_TEMPLATE,
+)
+
+from .move2place_prompt import (
+    get_move_to_place_prompt,
+    build_move_to_place_context,
+    MOVE_TO_PLACE_REPLY_TEMPLATE,
+)
+
+from .release_prompt import (
+    get_release_prompt,
+    build_release_context,
+    RELEASE_REPLY_TEMPLATE,
+)
+
 __all__ = [
     'BasePromptBuilder',
     # Pre-grasp
@@ -32,4 +50,16 @@ __all__ = [
     # Grasp feedback
     'get_grasp_feedback_prompt',
     'build_grasp_feedback_context',
+    # Lift
+    'get_lift_prompt',
+    'build_lift_context',
+    'LIFT_REPLY_TEMPLATE',
+    # Move to place
+    'get_move_to_place_prompt',
+    'build_move_to_place_context',
+    'MOVE_TO_PLACE_REPLY_TEMPLATE',
+    # Release
+    'get_release_prompt',
+    'build_release_context',
+    'RELEASE_REPLY_TEMPLATE',    
 ]

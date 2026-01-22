@@ -22,7 +22,8 @@ from .llm_client import LLMClient, create_llm_client
 from .prompts import get_pre_grasp_prompt, build_pre_grasp_context
 from .prompts import get_descend_prompt, build_descend_context
 from .prompts import get_grasp_feedback_prompt, build_grasp_feedback_context
-
+from .prompts import get_lift_prompt, build_lift_context
+from .prompts import get_move_to_place_prompt, build_move_to_place_context
 
 class LLMGraspPlanner:
     """
@@ -514,35 +515,446 @@ class LLMGraspPlanner:
         except Exception as e:
             self._log(f"Error parsing grasp feedback response: {e}")
             return None
-            
-    # ==================== Place Planning (Placeholder) ====================
-    
-    def plan_place(
+        
+    # ==================== Lift Planning ====================      
+  
+    def plan_lift(
         self,
-        current_position: List[float],
-        place_position: List[float],
-        place_yaw: float,
-        **kwargs
+        tcp_position: List[float],
+        tcp_yaw: float,
+        brick_position: Optional[List[float]] = None,
+        brick_yaw: Optional[float] = None,
+        brick_size: Optional[List[float]] = None,
+        lift_height: Optional[float] = None,
+        attempt_idx: int = 0,
+        feedback: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
-        Plan placement position.
+        Plan lift trajectory after successful grasp.
         
-        TODO: Implement when needed. For now, use config target position.
+        Args:
+            tcp_position: [x, y, z] current TCP position (at grasp height)
+            tcp_yaw: current TCP yaw angle in radians
+            brick_position: [x, y, z] brick position (optional)
+            brick_yaw: brick yaw angle (optional)
+            brick_size: [L, W, H] brick dimensions (optional)
+            lift_height: height to lift (optional, uses config default)
+            attempt_idx: Retry attempt number
+            feedback: Error feedback from previous attempt
+            
+        Returns:
+            Tuple of (success, result_dict, error_message)
+            
+            result_dict contains:
+            - target_position: [x, y, z] target TCP position after lift
+            - target_yaw: target yaw angle (unchanged)
+            - lift_height: actual lift height used
+            - reasoning: LLM's explanation
         """
-        self._log("Place planning not implemented, using config fallback")
+        # Use defaults from config
+        if brick_size is None:
+            brick_size = self.default_brick_size
         
+        if lift_height is None:
+            lift_height = self.grasp_config.get("lift_height", 0.10)
+        
+        # Build context
+        context = build_lift_context(
+            tcp_position=tcp_position,
+            tcp_yaw=tcp_yaw,
+            brick_position=brick_position,
+            brick_yaw=brick_yaw,
+            brick_size=brick_size,
+            lift_height=lift_height,
+        )
+        
+        # Generate prompt
+        system_prompt, user_prompt = get_lift_prompt(context, attempt_idx, feedback)
+        
+        # Debug: print prompt if enabled
+        if self.debug_config.get("print_llm_prompt", False):
+            print("\n" + "=" * 60)
+            print("[LLM Lift Prompt - System]")
+            print(system_prompt)
+            print("\n[LLM Lift Prompt - User]")
+            print(user_prompt)
+            print("=" * 60 + "\n")
+        
+        # Call LLM
+        success, response, error = self.llm_client.chat_json(system_prompt, user_prompt)
+        
+        if not success:
+            self._log(f"LLM lift call failed: {error}")
+            return False, None, error
+        
+        # Debug: print response
+        if self.debug_config.get("print_llm_response", True):
+            self._print_llm_response_summary(response, "Lift")
+        
+        # Parse response
+        result = self._parse_lift_response(response, tcp_position, tcp_yaw, lift_height)
+        
+        if result is None:
+            return False, None, "Failed to parse LLM lift response"
+        
+        return True, result, None
+    
+    def _parse_lift_response(
+        self,
+        response: Dict,
+        tcp_position: List[float],
+        tcp_yaw: float,
+        expected_lift_height: float,
+    ) -> Optional[Dict]:
+        """Parse LLM response for lift planning."""
+        try:
+            target_pose = response.get("target_pose", {})
+            xyz = target_pose.get("xyz", [])
+            yaw = target_pose.get("yaw", 0.0)
+            
+            lift_params = response.get("lift_params", {})
+            lift_height = lift_params.get("lift_height", expected_lift_height)
+            target_z = lift_params.get("target_z", tcp_position[2] + expected_lift_height)
+            
+            reasoning = response.get("reasoning", "")
+            verification = response.get("verification", {})
+            
+            if len(xyz) != 3:
+                self._log(f"Invalid xyz format: {xyz}")
+                return None
+            
+            # Validate XY unchanged
+            xy_tolerance = 0.005  # 5mm
+            if abs(xyz[0] - tcp_position[0]) > xy_tolerance:
+                self._log(f"Warning: X changed. Expected {tcp_position[0]:.4f}, got {xyz[0]:.4f}, correcting")
+                xyz[0] = tcp_position[0]
+            
+            if abs(xyz[1] - tcp_position[1]) > xy_tolerance:
+                self._log(f"Warning: Y changed. Expected {tcp_position[1]:.4f}, got {xyz[1]:.4f}, correcting")
+                xyz[1] = tcp_position[1]
+            
+            # Validate Z is higher
+            expected_z = tcp_position[2] + expected_lift_height
+            z_tolerance = 0.02  # 2cm
+            if abs(xyz[2] - expected_z) > z_tolerance:
+                self._log(f"Warning: Z deviation. Expected {expected_z:.4f}, got {xyz[2]:.4f}, correcting")
+                xyz[2] = expected_z
+            
+            # Validate yaw unchanged
+            yaw_tolerance = 0.05  # ~3 degrees
+            if abs(yaw - tcp_yaw) > yaw_tolerance:
+                self._log(f"Warning: Yaw changed. Expected {tcp_yaw:.4f}, got {yaw:.4f}, correcting")
+                yaw = tcp_yaw
+            
+            return {
+                "target_position": [float(xyz[0]), float(xyz[1]), float(xyz[2])],
+                "target_yaw": float(yaw),
+                "lift_height": float(lift_height),
+                "reasoning": reasoning,
+                "verification": verification,
+                "raw_response": response,
+            }
+            
+        except Exception as e:
+            self._log(f"Error parsing lift response: {e}")
+            return None
+
+    # ==================== Move to Place Planning ====================
+    
+    def plan_move_to_place(
+        self,
+        tcp_position: List[float],
+        tcp_yaw: float,
+        target_position: Optional[List[float]] = None,
+        target_yaw: Optional[float] = None,
+        brick_size: Optional[List[float]] = None,
+        attempt_idx: int = 0,
+        feedback: Optional[str] = None,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Plan horizontal movement from lift position to above placement target.
+        
+        Args:
+            tcp_position: [x, y, z] current TCP position (after lift)
+            tcp_yaw: current TCP yaw angle in radians
+            target_position: [x, y, z] target placement position (optional, uses config)
+            target_yaw: target yaw for placement (optional, uses config)
+            brick_size: [L, W, H] brick dimensions (optional)
+            attempt_idx: Retry attempt number
+            feedback: Error feedback from previous attempt
+            
+        Returns:
+            Tuple of (success, result_dict, error_message)
+            
+            result_dict contains:
+            - target_position: [x, y, z] target TCP position (Z unchanged)
+            - target_yaw: target yaw angle
+            - reasoning: LLM's explanation
+        """
+        # Use defaults from config
+        if brick_size is None:
+            brick_size = self.default_brick_size
+        
+        # Get place config
         place_config = self.config.get("place", {})
-        target = place_config.get("target_position", place_position)
-        target_yaw = place_config.get("target_yaw", place_yaw)
         
-        return True, {
-            "target_position": target,
-            "target_yaw": target_yaw,
-            "reasoning": "Using config place position",
-            "is_fallback": True,
-        }, None
+        if target_position is None:
+            target_position = place_config.get("target_position", [0.54, -0.04, 1.00])
+        
+        if target_yaw is None:
+            target_yaw = place_config.get("target_yaw", 0.0)
+        
+        # Build context
+        context = build_move_to_place_context(
+            tcp_position=tcp_position,
+            tcp_yaw=tcp_yaw,
+            target_position=target_position,
+            target_yaw=target_yaw,
+            brick_size=brick_size,
+        )
+        
+        # Generate prompt
+        system_prompt, user_prompt = get_move_to_place_prompt(context, attempt_idx, feedback)
+        
+        # Debug: print prompt if enabled
+        if self.debug_config.get("print_llm_prompt", False):
+            print("\n" + "=" * 60)
+            print("[LLM Move to Place Prompt - System]")
+            print(system_prompt)
+            print("\n[LLM Move to Place Prompt - User]")
+            print(user_prompt)
+            print("=" * 60 + "\n")
+        
+        # Call LLM
+        success, response, error = self.llm_client.chat_json(system_prompt, user_prompt)
+        
+        if not success:
+            self._log(f"LLM move_to_place call failed: {error}")
+            return False, None, error
+        
+        # Debug: print response
+        if self.debug_config.get("print_llm_response", True):
+            self._print_llm_response_summary(response, "MoveToPlace")
+        
+        # Parse response
+        result = self._parse_move_to_place_response(
+            response, tcp_position, target_position, target_yaw
+        )
+        
+        if result is None:
+            return False, None, "Failed to parse LLM move_to_place response"
+        
+        return True, result, None
+    
+    def _parse_move_to_place_response(
+        self,
+        response: Dict,
+        tcp_position: List[float],
+        target_position: List[float],
+        target_yaw: float,
+    ) -> Optional[Dict]:
+        """Parse LLM response for move-to-place planning."""
+        try:
+            target_pose = response.get("target_pose", {})
+            xyz = target_pose.get("xyz", [])
+            yaw = target_pose.get("yaw", 0.0)
+            
+            motion_params = response.get("motion_params", {})
+            reasoning = response.get("reasoning", "")
+            verification = response.get("verification", {})
+            
+            if len(xyz) != 3:
+                self._log(f"Invalid xyz format: {xyz}")
+                return None
+            
+            # Validate XY at target
+            xy_tolerance = 0.01  # 1cm
+            if abs(xyz[0] - target_position[0]) > xy_tolerance:
+                self._log(f"Warning: X deviation. Expected {target_position[0]:.4f}, got {xyz[0]:.4f}, correcting")
+                xyz[0] = target_position[0]
+            
+            if abs(xyz[1] - target_position[1]) > xy_tolerance:
+                self._log(f"Warning: Y deviation. Expected {target_position[1]:.4f}, got {xyz[1]:.4f}, correcting")
+                xyz[1] = target_position[1]
+            
+            # Validate Z unchanged (should stay at lift height)
+            z_tolerance = 0.02  # 2cm
+            if abs(xyz[2] - tcp_position[2]) > z_tolerance:
+                self._log(f"Warning: Z should be unchanged. Expected {tcp_position[2]:.4f}, got {xyz[2]:.4f}, correcting")
+                xyz[2] = tcp_position[2]
+            
+            # Validate yaw at target
+            yaw_tolerance = 0.1  # ~6 degrees
+            if abs(yaw - target_yaw) > yaw_tolerance:
+                self._log(f"Warning: Yaw deviation. Expected {target_yaw:.4f}, got {yaw:.4f}, correcting")
+                yaw = target_yaw
+            
+            return {
+                "target_position": [float(xyz[0]), float(xyz[1]), float(xyz[2])],
+                "target_yaw": float(yaw),
+                "motion_params": motion_params,
+                "reasoning": reasoning,
+                "verification": verification,
+                "raw_response": response,
+            }
+            
+        except Exception as e:
+            self._log(f"Error parsing move_to_place response: {e}")
+            return None
 
-
+    # ==================== Release Planning ====================
+    
+    def analyze_release_feedback(
+        self,
+        actual_z: float,
+        target_z: float,
+        contact_threshold_mm: float = 0.3,
+        descend_step: float = 0.005,
+        lift_step: float = 0.01,
+        attempt_number: int = 1,
+        max_attempts: int = 10,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Analyze placement feedback and decide release action.
+        
+        Args:
+            actual_z: Current TCP Z position (meters)
+            target_z: Target surface Z position (meters)
+            contact_threshold_mm: Threshold for contact detection (mm)
+            descend_step: Step size for descending (meters)
+            lift_step: Step size for lifting before release (meters)
+            attempt_number: Current attempt number
+            max_attempts: Maximum attempts
+            
+        Returns:
+            Tuple of (success, result_dict, error_message)
+            
+            result_dict contains:
+            - contact_detected: bool
+            - confidence: float
+            - analysis: {z_error_mm, contact_state}
+            - action: {type, delta_z, reason}
+            - reasoning: str
+        """
+        from .prompts import get_release_prompt, build_release_context
+        
+        # Build context
+        context = build_release_context(
+            actual_z=actual_z,
+            target_z=target_z,
+            contact_threshold_mm=contact_threshold_mm,
+            descend_step=descend_step,
+            lift_step=lift_step,
+            attempt_number=attempt_number,
+            max_attempts=max_attempts,
+        )
+        
+        # Generate prompt
+        system_prompt, user_prompt = get_release_prompt(context)
+        
+        # Debug: print prompt if enabled
+        if self.debug_config.get("print_llm_prompt", False):
+            print("\n" + "=" * 60)
+            print("[LLM Release Prompt - System]")
+            print(system_prompt)
+            print("\n[LLM Release Prompt - User]")
+            print(user_prompt)
+            print("=" * 60 + "\n")
+        
+        # Call LLM
+        success, response, error = self.llm_client.chat_json(system_prompt, user_prompt)
+        
+        if not success:
+            self._log(f"LLM release analysis failed: {error}")
+            return False, None, error
+        
+        # Debug: print response
+        if self.debug_config.get("print_llm_response", True):
+            self._print_release_summary(response)
+        
+        # Parse response
+        result = self._parse_release_response(response, descend_step, lift_step)
+        
+        if result is None:
+            return False, None, "Failed to parse LLM release response"
+        
+        return True, result, None
+    
+    def _print_release_summary(self, response: Dict):
+        """Print release analysis summary."""
+        contact_detected = response.get("contact_detected", False)
+        confidence = response.get("confidence", 0.0)
+        analysis = response.get("analysis", {})
+        action = response.get("action", {})
+        reasoning = response.get("reasoning", "N/A")
+        
+        z_error_mm = analysis.get("z_error_mm", 0)
+        contact_state = analysis.get("contact_state", "unknown")
+        action_type = action.get("type", "unknown")
+        delta_z = action.get("delta_z", 0)
+        
+        print(f"  [LLM Release] Contact: {contact_state} (z_error: {z_error_mm:+.1f} mm)")
+        print(f"  [LLM Release] Action: {action_type}, delta_z: {delta_z*1000:+.1f} mm")
+        print(f"  [LLM Release] Confidence: {confidence:.2f}")
+        print(f"  [LLM Release] Reason: {action.get('reason', 'N/A')}")
+    
+    def _parse_release_response(
+        self, 
+        response: Dict,
+        descend_step: float,
+        lift_step: float,
+    ) -> Optional[Dict]:
+        """Parse LLM response for release decision."""
+        try:
+            contact_detected = response.get("contact_detected", False)
+            confidence = response.get("confidence", 0.0)
+            analysis = response.get("analysis", {})
+            action = response.get("action", {})
+            reasoning = response.get("reasoning", "")
+            
+            action_type = action.get("type", "descend")
+            delta_z = action.get("delta_z", 0.0)
+            
+            # Normalize action type (no "release" allowed, convert to appropriate action)
+            if action_type == "release":
+                # Convert "release" to "descend" (keep going down)
+                action_type = "descend"
+                delta_z = -descend_step
+            
+            # Validate and clamp delta_z
+            if action_type == "descend":
+                # Should be negative (going down)
+                delta_z = -abs(delta_z) if delta_z != 0 else -descend_step
+                delta_z = max(delta_z, -0.02)  # Max 2cm down
+            elif action_type == "lift_then_release":
+                # Should be positive (going up)
+                delta_z = abs(delta_z) if delta_z != 0 else lift_step
+                delta_z = min(delta_z, 0.02)  # Max 2cm up
+            
+            # Normalize contact_state (no "just_contact")
+            contact_state = analysis.get("contact_state", "no_contact")
+            if contact_state == "just_contact":
+                contact_state = "no_contact"
+            
+            return {
+                "contact_detected": bool(contact_detected),
+                "confidence": float(np.clip(confidence, 0.0, 1.0)),
+                "analysis": {
+                    "z_error_mm": float(analysis.get("z_error_mm", 0)),
+                    "contact_state": contact_state,
+                },
+                "action": {
+                    "type": action_type,
+                    "delta_z": float(delta_z),
+                    "reason": action.get("reason", ""),
+                },
+                "reasoning": reasoning,
+                "raw_response": response,
+            }
+            
+        except Exception as e:
+            self._log(f"Error parsing release response: {e}")
+            return None
 # ==================== Factory Function ====================
 
 def create_grasp_planner(config_path: Optional[str] = None) -> LLMGraspPlanner:
