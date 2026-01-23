@@ -296,7 +296,7 @@ class BrickGraspController:
         print(f"[Init] Connecting to robot {ip}...")
         self.robot = MMK2RealRobot(ip=ip)
         self.robot.set_robot_head_pose(0, -1.08)
-        self.robot.set_spine(0.08)
+        self.robot.set_spine(0.05)
         
         # Initialize segmenter
         self.segmenter = SAM3Segmenter(checkpoint)
@@ -464,7 +464,7 @@ class BrickGraspController:
             MMK2Components.RIGHT_ARM: JointState(position=[0.0, 0.0, 0.324, 0.0, -0.724, 0.0]),
             MMK2Components.LEFT_ARM_EEF: JointState(position=[1.0]),
             MMK2Components.RIGHT_ARM_EEF: JointState(position=[1.0]),
-            MMK2Components.SPINE: JointState(position=[0.08]),
+            MMK2Components.SPINE: JointState(position=[0.05]),
         }
         try:
             result = self.robot.mmk2.set_goal(arm_action, TrajectoryParams())

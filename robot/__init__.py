@@ -1,16 +1,12 @@
 """
-Robot Environment Module
-
-Provides unified interface for robot control and sensing.
-Supports both real robot and simulation (future).
+Robot Module - Environment and Motion Execution
 """
 
-from .real_env import RealRobotEnv
-
-# Alias for convenience
-RobotEnv = RealRobotEnv
+from .real_env import RealRobotEnv as RobotEnv
+from .motion_executor import GraspPlaceExecutor, create_executor
 
 __all__ = [
-    'RealRobotEnv',
     'RobotEnv',
+    'GraspPlaceExecutor',
+    'create_executor',
 ]

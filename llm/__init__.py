@@ -21,7 +21,10 @@ from .prompts import (
     MOVE_TO_PLACE_REPLY_TEMPLATE,
     get_release_prompt,
     build_release_context,
-    RELEASE_REPLY_TEMPLATE,    
+    RELEASE_REPLY_TEMPLATE,
+    get_scene_analysis_prompt,
+    build_scene_analysis_context,
+    SCENE_ANALYSIS_REPLY_TEMPLATE,
 )
 
 __all__ = [
@@ -48,5 +51,8 @@ __all__ = [
     'MOVE_TO_PLACE_REPLY_TEMPLATE',
     'get_release_prompt',
     'build_release_context',
-    'RELEASE_REPLY_TEMPLATE',    
+    'RELEASE_REPLY_TEMPLATE',
+    'get_scene_analysis_prompt',
+    'build_scene_analysis_context',
+    'SCENE_ANALYSIS_REPLY_TEMPLATE',
 ]

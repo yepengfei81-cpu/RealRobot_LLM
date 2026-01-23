@@ -4,6 +4,8 @@ Grasp Feedback Prompt for Real Robot
 This prompt enables LLM to analyze grasp attempt results and suggest corrections.
 Uses sensor feedback (gripper effort, position) to determine grasp success
 and compute adjustment if needed.
+
+Now includes historical compensation data for adaptive learning.
 """
 
 import math
@@ -28,6 +30,10 @@ GRASP_FEEDBACK_REPLY_TEMPLATE = """
     "delta_z": <float in meters, positive=up, negative=down>,
     "reason": "<string explaining the adjustment>"
   },
+  "learning": {
+    "recommended_compensation": <float in meters, suggested offset for future grasps>,
+    "compensation_confidence": <float 0.0-1.0>
+  },
   "reasoning": "Brief analysis of the grasp attempt (max 80 words)"
 }
 """.strip()
@@ -41,10 +47,12 @@ class GraspFeedbackPromptBuilder(BasePromptBuilder):
     
     Goal: Analyze sensor data after grasp attempt to determine success
     and suggest Z-axis corrections if needed.
+    
+    Now includes historical compensation learning.
     """
     
     def _get_current_phase_name(self) -> str:
-        return "Grasp Feedback Analysis"
+        return "Grasp Feedback Analysis with Adaptive Learning"
     
     def _get_completed_steps(self) -> List[str]:
         return [
@@ -58,19 +66,21 @@ class GraspFeedbackPromptBuilder(BasePromptBuilder):
     def _get_pending_steps(self) -> List[str]:
         return [
             "Analyze grasp success from sensor feedback (current task)",
-            "If failed: adjust Z and retry",
-            "If success: lift and place brick",
+            "Learn from historical compensation data",
+            "If failed: compute adjusted Z using learned compensation",
+            "If success: update recommended compensation for future",
         ]
     
     def _get_role_name(self) -> str:
-        return "Grasp Feedback Analysis Expert"
+        return "Adaptive Grasp Feedback Analysis Expert"
     
     def _get_main_responsibilities(self) -> List[str]:
         return [
             "Analyze gripper effort/current to detect successful grasp",
             "Determine failure mode (too high, too low, misaligned)",
-            "Compute Z adjustment for retry if needed",
-            "Ensure safe operation within retry limits",
+            "Learn from historical compensation data to improve accuracy",
+            "Compute Z adjustment that incorporates learned patterns",
+            "Recommend compensation value for future grasp attempts",
         ]
     
     def _get_specific_task(self) -> str:
@@ -93,8 +103,26 @@ class GraspFeedbackPromptBuilder(BasePromptBuilder):
         attempt_num = attempt.get('number', 1)
         max_attempts = attempt.get('max', 3)
         
+        # Historical compensation data
+        compensation = self.context.get('compensation', {})
+        history = compensation.get('history', [])
+        current_compensation = compensation.get('current', 0.0)
+        applied_this_grasp = compensation.get('applied_this_grasp', 0.0)
+        
+        # Format history
+        history_str = ""
+        if history:
+            history_str = "\n**Historical Compensation Data (from previous successful grasps):**\n"
+            for i, h in enumerate(history[-5:]):  # Show last 5
+                history_str += f"  - Grasp {i+1}: adjustment = {h*1000:+.1f} mm\n"
+            history_str += f"  - Current learned compensation: {current_compensation*1000:+.1f} mm\n"
+            history_str += f"  - Applied to this grasp: {applied_this_grasp*1000:+.1f} mm\n"
+        else:
+            history_str = "\n**No historical compensation data yet (first grasp attempt).**\n"
+        
         return f"""
 Analyze the grasp attempt and determine if adjustment is needed.
+Use historical compensation data to make smarter adjustments.
 
 **Sensor Feedback After Grasp Attempt #{attempt_num}/{max_attempts}:**
 - Gripper effort (motor current): {effort:.3f} A
@@ -106,33 +134,36 @@ Analyze the grasp attempt and determine if adjustment is needed.
 - Current TCP Z: {tcp_z:.4f} m
 - Target brick position: [{brick_pos[0]:.4f}, {brick_pos[1]:.4f}, {brick_pos[2]:.4f}] m
 - Brick dimensions (L×W×H): [{brick_size[0]:.3f}, {brick_size[1]:.3f}, {brick_size[2]:.3f}] m
+{history_str}
 
 **Analysis Rules:**
 
 1. **SUCCESS** (grasp_success = true):
    - effort > {effort_threshold:.1f} A (contact detected)
    - gap ≈ brick_width ({brick_width:.3f} m) ± 0.015 m
+   - Update recommended_compensation based on any runtime adjustments
 
 2. **TOO HIGH** (gripper closed above brick):
    - effort ≈ 0 (no contact)
    - gap ≈ 0 (gripper closed on air)
-   - Adjustment: delta_z = -{brick_height:.3f} to -{brick_height*1.5:.3f} m (descend by brick height)
+   - **Use historical data**: If previous grasps needed ~X mm descent, suggest similar
+   - Adjustment: delta_z should incorporate learned compensation
 
 3. **TOO LOW** (gripper hit table):
    - effort > threshold (contact with table)
    - gap ≈ 0 (fingers blocked by table)
    - Adjustment: delta_z = +0.01 to +0.02 m (raise slightly)
 
-4. **PARTIAL GRASP** (brick edge or unstable):
-   - effort > threshold but lower than expected
-   - gap slightly different from brick_width
-   - May need XY adjustment (flag for re-detection)
+**Adaptive Learning Rules:**
+- If this is attempt #1 and we have history, the compensation was already applied
+- If adjustment is still needed, the NEW delta_z should be ADDITIONAL to what was applied
+- On success: recommended_compensation = applied_this_grasp + any runtime delta_z
+- On failure: recommended_compensation should be updated based on observed error
 
 **Your Task:**
-Analyze the sensor data and determine:
-1. Is the grasp successful?
-2. If not, what is the failure mode?
-3. What Z adjustment is needed for retry?
+1. Analyze the sensor data to determine grasp success
+2. If failed, compute delta_z considering historical patterns
+3. Update recommended_compensation for future grasps
 """.strip()
     
     def _get_phase_specific_knowledge(self) -> str:
@@ -144,6 +175,10 @@ Analyze the sensor data and determine:
         brick_size = self.brick.get('size_LWH', [0.11, 0.05, 0.025])
         brick_width = brick_size[1]
         brick_height = brick_size[2]
+        
+        compensation = self.context.get('compensation', {})
+        current_compensation = compensation.get('current', 0.0)
+        applied_this_grasp = compensation.get('applied_this_grasp', 0.0)
         
         return f"""
 **Sensor Interpretation Guide:**
@@ -164,11 +199,31 @@ Effort vs Gap Analysis:
 - Effort: {effort:.3f} A (threshold: {effort_threshold:.1f} A)
 - Gap: {gap:.4f} m (expected for brick: {brick_width:.3f} m)
 
-**Adjustment Guidelines:**
-- If TOO HIGH: descend by {brick_height:.3f}m ~ {brick_height*1.5:.3f}m (brick height or more)
-- If TOO LOW: raise by 0.01m ~ 0.02m (small increment)
-- Max single adjustment: ±0.05m for safety
-- Do not exceed {self.context.get('attempt', {}).get('max', 3)} total attempts
+**Adaptive Compensation Logic:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ FIRST GRASP (no history):                                       │
+│   - Use standard adjustment: -{brick_height:.3f}m for too_high  │
+│   - Record result for future learning                           │
+├─────────────────────────────────────────────────────────────────┤
+│ SUBSEQUENT GRASPS (with history):                               │
+│   - Compensation {applied_this_grasp*1000:+.1f} mm was pre-applied           │
+│   - If still too_high: add MORE descent (delta_z negative)      │
+│   - If too_low: reduce compensation (delta_z positive)          │
+│   - Update recommended_compensation accordingly                 │
+├─────────────────────────────────────────────────────────────────┤
+│ ON SUCCESS:                                                     │
+│   - recommended_compensation = total offset that worked         │
+│   - This becomes the baseline for next grasp                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Compensation Calculation:**
+- Current learned compensation: {current_compensation*1000:+.1f} mm
+- Applied this grasp: {applied_this_grasp*1000:+.1f} mm
+- If SUCCESS: recommended_compensation = {applied_this_grasp*1000:+.1f} mm (keep what worked)
+- If TOO HIGH: recommended_compensation = {applied_this_grasp*1000:+.1f} mm + delta_z (more descent)
+- If TOO LOW: recommended_compensation = {applied_this_grasp*1000:+.1f} mm + delta_z (less descent)
 """.strip()
     
     def _get_thinking_steps(self) -> List[Dict[str, str]]:
@@ -179,43 +234,47 @@ Effort vs Gap Analysis:
         brick_width = self.brick.get('size_LWH', [0.11, 0.05, 0.025])[1]
         brick_height = self.brick.get('size_LWH', [0.11, 0.05, 0.025])[2]
         
+        compensation = self.context.get('compensation', {})
+        current_compensation = compensation.get('current', 0.0)
+        applied_this_grasp = compensation.get('applied_this_grasp', 0.0)
+        history = compensation.get('history', [])
+        
         effort_ok = effort > effort_threshold
         gap_ok = abs(gap - brick_width) < 0.015
         
         return [
             {
-                "title": "Step 1: Analyze Effort",
+                "title": "Step 1: Analyze Sensor Feedback",
                 "content": f"""
-- Measured effort: {effort:.3f} A
-- Threshold: {effort_threshold:.1f} A
-- Contact detected: {"YES" if effort_ok else "NO"}
+- Measured effort: {effort:.3f} A (threshold: {effort_threshold:.1f} A) → {"Contact" if effort_ok else "No contact"}
+- Gap after close: {gap:.4f} m (expected: {brick_width:.3f} m) → {"Matches brick" if gap_ok else "Mismatch"}
 """.strip()
             },
             {
-                "title": "Step 2: Analyze Gap",
+                "title": "Step 2: Review Compensation History",
                 "content": f"""
-- Gap after close: {gap:.4f} m
-- Expected (brick width): {brick_width:.3f} m
-- Difference: {abs(gap - brick_width):.4f} m
-- Gap matches brick: {"YES" if gap_ok else "NO"}
+- Historical adjustments: {len(history)} records
+- Learned compensation: {current_compensation*1000:+.1f} mm
+- Applied to this attempt: {applied_this_grasp*1000:+.1f} mm
+- Was the applied compensation sufficient?
 """.strip()
             },
             {
-                "title": "Step 3: Determine Outcome",
+                "title": "Step 3: Determine Outcome & Compute Adjustment",
                 "content": f"""
-- Effort OK: {"✓" if effort_ok else "✗"}
-- Gap OK: {"✓" if gap_ok else "✗"}
-- If both OK → SUCCESS
-- If effort=0 and gap=0 → TOO HIGH (missed)
-- If effort>0 and gap=0 → TOO LOW (table contact)
+- If SUCCESS: recommended_compensation = applied amount ({applied_this_grasp*1000:+.1f} mm)
+- If TOO HIGH: need additional descent, delta_z = -{brick_height*1000:.1f} to -{brick_height*1.5*1000:.1f} mm
+  → recommended_compensation = {applied_this_grasp*1000:.1f} + delta_z
+- If TOO LOW: need to raise, delta_z = +10 to +20 mm
+  → recommended_compensation = {applied_this_grasp*1000:.1f} + delta_z
 """.strip()
             },
             {
-                "title": "Step 4: Compute Adjustment (if needed)",
+                "title": "Step 4: Output Learning Update",
                 "content": f"""
-- If TOO HIGH: delta_z = -{brick_height:.3f} m (descend)
-- If TOO LOW: delta_z = +0.015 m (raise)
-- If SUCCESS: delta_z = 0, no adjustment needed
+- recommended_compensation: the Z offset to apply to FUTURE grasps
+- compensation_confidence: how certain we are (higher if consistent history)
+- This value will be used by the system in the next grasp attempt
 """.strip()
             },
         ]
@@ -224,11 +283,16 @@ Effort vs Gap Analysis:
         return GRASP_FEEDBACK_REPLY_TEMPLATE
     
     def _get_output_constraints(self) -> List[str]:
+        compensation = self.context.get('compensation', {})
+        applied = compensation.get('applied_this_grasp', 0.0)
+        
         return [
             "grasp_success: true only if effort > threshold AND gap ≈ brick_width",
             "confidence: 0.0-1.0, higher if sensor readings are clear",
             "failure_mode: 'none', 'too_high', 'too_low', 'xy_misaligned', or 'unknown'",
-            "delta_z: positive = move up, negative = move down, range [-0.05, 0.05] m",
+            "delta_z: ADDITIONAL adjustment needed NOW, range [-0.05, 0.05] m",
+            f"recommended_compensation: total offset for FUTURE grasps (current applied: {applied*1000:+.1f} mm)",
+            "compensation_confidence: 0.0-1.0, higher if pattern is consistent",
             "adjustment.needed must be false if grasp_success is true",
             "Output JSON only, no markdown code blocks",
         ]
@@ -256,6 +320,9 @@ def build_grasp_feedback_context(
     effort_threshold: float = 2.0,
     attempt_number: int = 1,
     max_attempts: int = 3,
+    compensation_history: Optional[List[float]] = None,
+    current_compensation: float = 0.0,
+    applied_compensation: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Build context for grasp feedback prompt.
@@ -270,6 +337,9 @@ def build_grasp_feedback_context(
         effort_threshold: threshold for detecting contact (default 2.0 A)
         attempt_number: current attempt number
         max_attempts: maximum retry attempts
+        compensation_history: list of past successful compensation values
+        current_compensation: current learned compensation value
+        applied_compensation: compensation applied to this grasp attempt
     """
     return {
         "robot": {"dof": 6},
@@ -291,5 +361,10 @@ def build_grasp_feedback_context(
         "attempt": {
             "number": attempt_number,
             "max": max_attempts,
+        },
+        "compensation": {
+            "history": compensation_history or [],
+            "current": current_compensation,
+            "applied_this_grasp": applied_compensation,
         },
     }

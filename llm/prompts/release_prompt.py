@@ -85,7 +85,7 @@ class ReleasePromptBuilder(BasePromptBuilder):
         thresholds = self.context.get('thresholds', {})
         contact_threshold_mm = thresholds.get('contact_mm', 0.6)
         descend_step = thresholds.get('descend_step', 0.008)
-        lift_step = thresholds.get('lift_step', 0.01)
+        lift_step = thresholds.get('lift_step', 0.005)
         
         attempt = self.context.get('attempt', {})
         attempt_num = attempt.get('number', 1)
@@ -128,7 +128,7 @@ Analyze the placement state and decide the release action.
         thresholds = self.context.get('thresholds', {})
         contact_threshold_mm = thresholds.get('contact_mm', 0.6)
         descend_step = thresholds.get('descend_step', 0.008)
-        lift_step = thresholds.get('lift_step', 0.01)
+        lift_step = thresholds.get('lift_step', 0.005)
         
         return f"""
 **Contact Detection Logic (Simplified):**
@@ -165,7 +165,7 @@ Z Error = Actual_Z - Target_Z
         thresholds = self.context.get('thresholds', {})
         contact_threshold_mm = thresholds.get('contact_mm', 0.6)
         descend_step = thresholds.get('descend_step', 0.008)
-        lift_step = thresholds.get('lift_step', 0.01)
+        lift_step = thresholds.get('lift_step', 0.005)
         
         is_pressing = z_error_mm > contact_threshold_mm
         
@@ -203,7 +203,7 @@ Z Error = Actual_Z - Target_Z
         thresholds = self.context.get('thresholds', {})
         contact_threshold_mm = thresholds.get('contact_mm', 0.6)
         descend_step = thresholds.get('descend_step', 0.008)
-        lift_step = thresholds.get('lift_step', 0.01)
+        lift_step = thresholds.get('lift_step', 0.005)
         
         return [
             "contact_detected: true ONLY if z_error > +{:.1f} mm".format(contact_threshold_mm),

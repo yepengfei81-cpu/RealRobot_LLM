@@ -380,9 +380,12 @@ class LLMGraspPlanner:
         brick_size: Optional[List[float]] = None,
         attempt_number: int = 1,
         max_attempts: int = 3,
+        compensation_history: Optional[List[float]] = None,
+        current_compensation: float = 0.0,
+        applied_compensation: float = 0.0,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
-        Analyze grasp attempt using sensor feedback.
+        Analyze grasp attempt using sensor feedback with adaptive learning.
         
         Args:
             brick_position: [x, y, z] target grasp position
@@ -393,6 +396,9 @@ class LLMGraspPlanner:
             brick_size: [L, W, H] brick dimensions
             attempt_number: current attempt number
             max_attempts: maximum retry attempts
+            compensation_history: list of past successful compensation values (meters)
+            current_compensation: current learned compensation value (meters)
+            applied_compensation: compensation applied to this grasp attempt (meters)
             
         Returns:
             Tuple of (success, result_dict, error_message)
@@ -402,6 +408,7 @@ class LLMGraspPlanner:
             - confidence: float
             - analysis: {effort_indicates_contact, position_at_brick_center, failure_mode}
             - adjustment: {needed: bool, delta_z: float, reason: str}
+            - learning: {recommended_compensation: float, compensation_confidence: float}
             - reasoning: str
         """
         if brick_size is None:
@@ -409,7 +416,7 @@ class LLMGraspPlanner:
         
         effort_threshold = self.grasp_config.get("grasp_effort_threshold", 2.0)
         
-        # Build context
+        # Build context with compensation data
         context = build_grasp_feedback_context(
             brick_position=brick_position,
             brick_yaw=brick_yaw,
@@ -420,6 +427,9 @@ class LLMGraspPlanner:
             effort_threshold=effort_threshold,
             attempt_number=attempt_number,
             max_attempts=max_attempts,
+            compensation_history=compensation_history,
+            current_compensation=current_compensation,
+            applied_compensation=applied_compensation,
         )
         
         # Generate prompt
@@ -443,22 +453,23 @@ class LLMGraspPlanner:
         
         # Debug: print response
         if self.debug_config.get("print_llm_response", True):
-            self._print_grasp_feedback_summary(response)
+            self._print_grasp_feedback_summary(response, applied_compensation)
         
         # Parse response
-        result = self._parse_grasp_feedback_response(response)
+        result = self._parse_grasp_feedback_response(response, applied_compensation)
         
         if result is None:
             return False, None, "Failed to parse LLM feedback response"
         
         return True, result, None
     
-    def _print_grasp_feedback_summary(self, response: Dict):
+    def _print_grasp_feedback_summary(self, response: Dict, applied_compensation: float = 0.0):
         """Print grasp feedback analysis summary."""
         grasp_success = response.get("grasp_success", False)
         confidence = response.get("confidence", 0.0)
         analysis = response.get("analysis", {})
         adjustment = response.get("adjustment", {})
+        learning = response.get("learning", {})
         reasoning = response.get("reasoning", "N/A")
         
         status = "✓ SUCCESS" if grasp_success else "✗ FAILED"
@@ -474,15 +485,21 @@ class LLMGraspPlanner:
             print(f"  [LLM Feedback] Adjustment: {direction} {abs(delta_z)*1000:.1f} mm")
             print(f"  [LLM Feedback] Reason: {adjustment.get('reason', 'N/A')}")
         
+        # Show learning output
+        recommended = learning.get("recommended_compensation", applied_compensation)
+        comp_confidence = learning.get("compensation_confidence", 0.0)
+        print(f"  [LLM Learning] Recommended compensation: {recommended*1000:+.1f} mm (confidence: {comp_confidence:.2f})")
+        
         print(f"  [LLM Feedback] Analysis: {reasoning}")
     
-    def _parse_grasp_feedback_response(self, response: Dict) -> Optional[Dict]:
+    def _parse_grasp_feedback_response(self, response: Dict, applied_compensation: float = 0.0) -> Optional[Dict]:
         """Parse LLM response for grasp feedback analysis."""
         try:
             grasp_success = response.get("grasp_success", False)
             confidence = response.get("confidence", 0.0)
             analysis = response.get("analysis", {})
             adjustment = response.get("adjustment", {})
+            learning = response.get("learning", {})
             reasoning = response.get("reasoning", "")
             
             # Validate and clamp delta_z
@@ -494,6 +511,14 @@ class LLMGraspPlanner:
             if grasp_success:
                 delta_z = 0.0
                 adjustment["needed"] = False
+            
+            # Parse learning output
+            recommended_compensation = learning.get("recommended_compensation", applied_compensation)
+            compensation_confidence = learning.get("compensation_confidence", 0.5)
+            
+            # Clamp compensation to reasonable range
+            max_compensation = 0.05  # 5cm max
+            recommended_compensation = float(np.clip(recommended_compensation, -max_compensation, max_compensation))
             
             return {
                 "grasp_success": bool(grasp_success),
@@ -508,6 +533,10 @@ class LLMGraspPlanner:
                     "delta_z": delta_z,
                     "reason": adjustment.get("reason", ""),
                 },
+                "learning": {
+                    "recommended_compensation": recommended_compensation,
+                    "compensation_confidence": float(np.clip(compensation_confidence, 0.0, 1.0)),
+                },
                 "reasoning": reasoning,
                 "raw_response": response,
             }
@@ -515,7 +544,6 @@ class LLMGraspPlanner:
         except Exception as e:
             self._log(f"Error parsing grasp feedback response: {e}")
             return None
-        
     # ==================== Lift Planning ====================      
   
     def plan_lift(
@@ -955,6 +983,163 @@ class LLMGraspPlanner:
         except Exception as e:
             self._log(f"Error parsing release response: {e}")
             return None
+
+    # ==================== Scene Analysis ====================
+    
+    def analyze_scene(
+        self,
+        detected_bricks: List[Dict[str, Any]],
+        target_position: List[float],
+        placed_count: int = 0,
+        initial_brick_count: Optional[int] = None,
+        proximity_threshold: float = 0.08,
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
+        """
+        Analyze scene for multi-brick stacking task.
+        
+        Args:
+            detected_bricks: List of detected brick info, each with:
+                - position: [x, y, z] in base_link frame
+                - yaw: orientation (optional)
+            target_position: [x, y, z] target placement position
+            placed_count: Number of bricks already placed
+            initial_brick_count: Initial number of bricks (if known)
+            proximity_threshold: Distance threshold for "at target" (meters)
+            
+        Returns:
+            Tuple of (success, result_dict, error_message)
+            
+            result_dict contains:
+            - task_complete: bool
+            - confidence: float
+            - scene_state: {total_bricks_detected, bricks_at_target, bricks_to_grasp, estimated_stack_height}
+            - next_action: {type, target_brick_index, reason}
+            - analysis: {target_area_status, completion_criteria_met, reasoning}
+        """
+        from .prompts import get_scene_analysis_prompt, build_scene_analysis_context
+        
+        # Get brick config
+        brick_height = self.brick_config.get("size_LWH", [0.11, 0.05, 0.025])[2]
+        stack_increment = brick_height + 0.003  # 3mm margin
+        
+        # Build context
+        context = build_scene_analysis_context(
+            detected_bricks=detected_bricks,
+            target_position=target_position,
+            placed_count=placed_count,
+            initial_brick_count=initial_brick_count,
+            proximity_threshold=proximity_threshold,
+            brick_height=brick_height,
+            stack_increment=stack_increment,
+        )
+        
+        # Generate prompt
+        system_prompt, user_prompt = get_scene_analysis_prompt(context)
+        
+        # Debug: print prompt if enabled
+        if self.debug_config.get("print_llm_prompt", False):
+            print("\n" + "=" * 60)
+            print("[LLM Scene Analysis Prompt - System]")
+            print(system_prompt)
+            print("\n[LLM Scene Analysis Prompt - User]")
+            print(user_prompt)
+            print("=" * 60 + "\n")
+        
+        # Call LLM
+        success, response, error = self.llm_client.chat_json(system_prompt, user_prompt)
+        
+        if not success:
+            self._log(f"LLM scene analysis failed: {error}")
+            return False, None, error
+        
+        # Debug: print response
+        if self.debug_config.get("print_llm_response", True):
+            self._print_scene_analysis_summary(response)
+        
+        # Parse response
+        result = self._parse_scene_analysis_response(response, len(detected_bricks))
+        
+        if result is None:
+            return False, None, "Failed to parse LLM scene analysis response"
+        
+        return True, result, None
+    
+    def _print_scene_analysis_summary(self, response: Dict):
+        """Print scene analysis summary."""
+        task_complete = response.get("task_complete", False)
+        confidence = response.get("confidence", 0.0)
+        scene_state = response.get("scene_state", {})
+        next_action = response.get("next_action", {})
+        analysis = response.get("analysis", {})
+        
+        total = scene_state.get("total_bricks_detected", 0)
+        at_target = scene_state.get("bricks_at_target", 0)
+        to_grasp = scene_state.get("bricks_to_grasp", 0)
+        
+        status = "✓ COMPLETE" if task_complete else "→ IN PROGRESS"
+        print(f"  [LLM Scene] {status} (confidence: {confidence:.2f})")
+        print(f"  [LLM Scene] Bricks: {total} total, {at_target} at target, {to_grasp} to grasp")
+        
+        action_type = next_action.get("type", "unknown")
+        if action_type == "grasp":
+            idx = next_action.get("target_brick_index", -1)
+            print(f"  [LLM Scene] Next: Grasp brick #{idx}")
+        elif action_type == "complete":
+            print(f"  [LLM Scene] Next: Task complete!")
+        else:
+            print(f"  [LLM Scene] Next: {action_type} - {next_action.get('reason', 'N/A')}")
+    
+    def _parse_scene_analysis_response(
+        self, 
+        response: Dict,
+        num_detected: int,
+    ) -> Optional[Dict]:
+        """Parse LLM response for scene analysis."""
+        try:
+            task_complete = response.get("task_complete", False)
+            confidence = response.get("confidence", 0.0)
+            scene_state = response.get("scene_state", {})
+            next_action = response.get("next_action", {})
+            analysis = response.get("analysis", {})
+            
+            action_type = next_action.get("type", "error")
+            target_idx = next_action.get("target_brick_index")
+            
+            # Validate target_brick_index
+            if action_type == "grasp":
+                if target_idx is None or not isinstance(target_idx, int):
+                    self._log("Warning: grasp action but no valid target_brick_index")
+                    # Try to find a valid brick (first one away from target)
+                    target_idx = 0 if num_detected > 0 else None
+                elif target_idx < 0 or target_idx >= num_detected:
+                    self._log(f"Warning: target_brick_index {target_idx} out of range [0, {num_detected})")
+                    target_idx = 0 if num_detected > 0 else None
+            
+            return {
+                "task_complete": bool(task_complete),
+                "confidence": float(np.clip(confidence, 0.0, 1.0)),
+                "scene_state": {
+                    "total_bricks_detected": int(scene_state.get("total_bricks_detected", num_detected)),
+                    "bricks_at_target": int(scene_state.get("bricks_at_target", 0)),
+                    "bricks_to_grasp": int(scene_state.get("bricks_to_grasp", num_detected)),
+                    "estimated_stack_height": int(scene_state.get("estimated_stack_height", 0)),
+                },
+                "next_action": {
+                    "type": action_type,
+                    "target_brick_index": target_idx,
+                    "reason": next_action.get("reason", ""),
+                },
+                "analysis": {
+                    "target_area_status": analysis.get("target_area_status", "unknown"),
+                    "completion_criteria_met": analysis.get("completion_criteria_met", False),
+                    "reasoning": analysis.get("reasoning", ""),
+                },
+                "raw_response": response,
+            }
+            
+        except Exception as e:
+            self._log(f"Error parsing scene analysis response: {e}")
+            return None        
 # ==================== Factory Function ====================
 
 def create_grasp_planner(config_path: Optional[str] = None) -> LLMGraspPlanner:

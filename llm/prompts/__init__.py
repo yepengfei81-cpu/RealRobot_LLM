@@ -38,6 +38,12 @@ from .release_prompt import (
     RELEASE_REPLY_TEMPLATE,
 )
 
+from .scene_analysis_prompt import (
+    get_scene_analysis_prompt,
+    build_scene_analysis_context,
+    SCENE_ANALYSIS_REPLY_TEMPLATE,
+)
+
 __all__ = [
     'BasePromptBuilder',
     # Pre-grasp
@@ -61,5 +67,9 @@ __all__ = [
     # Release
     'get_release_prompt',
     'build_release_context',
-    'RELEASE_REPLY_TEMPLATE',    
+    'RELEASE_REPLY_TEMPLATE',
+    # Scene analysis
+    'get_scene_analysis_prompt',
+    'build_scene_analysis_context',
+    'SCENE_ANALYSIS_REPLY_TEMPLATE',
 ]
