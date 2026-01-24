@@ -35,7 +35,7 @@ class GraspPlaceExecutor:
         Args:
             robot_env: RobotEnv instance for robot control
             segmenter: SAM3 segmenter for brick detection
-            head_calc: Head camera position calculator
+            head_calc: Head camera position calculator (with DynamicZCompensator)
             handeye_calc: Hand-eye camera position calculator
             llm_planner: LLM grasp planner
             prompt: Segmentation prompt for brick detection
@@ -51,11 +51,6 @@ class GraspPlaceExecutor:
         self._step_callback: Optional[Callable[[str], None]] = None
         self._result_callback: Optional[Callable[[str, Dict], None]] = None
         self._mask_callback: Optional[Callable[[str, np.ndarray], None]] = None
-
-        # ===== LLM-driven Adaptive Compensation =====
-        self._compensation_history: List[float] = []
-        self._current_compensation: float = 0.0
-        self._max_history_size: int = 10
 
         # Abort check function
         self._check_abort: Callable[[], bool] = lambda: False
@@ -93,27 +88,6 @@ class GraspPlaceExecutor:
         if self._mask_callback:
             self._mask_callback(key, mask)
 
-    # ==================== Compensation Management ====================
-    
-    def get_compensation_state(self) -> Dict[str, Any]:
-        """Get current compensation state for debugging."""
-        return {
-            'current': self._current_compensation,
-            'history': self._compensation_history.copy(),
-            'history_size': len(self._compensation_history),
-        }
-    
-    def reset_compensation(self):
-        """Reset compensation learning."""
-        self._compensation_history.clear()
-        self._current_compensation = 0.0
-        print("[Compensation] Reset - LLM will learn from scratch")
-    
-    def set_compensation(self, value: float):
-        """Manually set compensation value."""
-        self._current_compensation = value
-        print(f"[Compensation] Manually set to {value*1000:+.1f} mm")
-
     # ==================== Step 1: Head Camera Detection ====================
     
     def detect_with_head_camera(
@@ -125,6 +99,8 @@ class GraspPlaceExecutor:
         """
         Detect brick(s) using head camera.
         
+        The head_calc already includes DynamicZCompensator for Z correction.
+        
         Args:
             rgb: RGB image from head camera
             depth: Depth image from head camera
@@ -132,7 +108,7 @@ class GraspPlaceExecutor:
             
         Returns:
             Tuple of (success, result_dict, error_message)
-            result_dict contains: position, yaw, all_masks (if multiple)
+            result_dict contains: position (Z-compensated), yaw, z_compensation, all_masks (if multiple)
         """
         self._log_step("\n[Step 1/10] Head camera detection...")
         
@@ -155,7 +131,7 @@ class GraspPlaceExecutor:
         if select_index >= len(masks):
             select_index = 0
         
-        # Calculate position
+        # Calculate position (head_calc includes DynamicZCompensator)
         head_result = self.head_calc.compute(masks[select_index], depth, tf_matrix)
         if head_result is None:
             return False, None, "Position calculation failed"
@@ -166,10 +142,12 @@ class GraspPlaceExecutor:
         # Build result
         brick_pos = head_result['position']
         brick_yaw = head_result['yaw']
+        z_compensation = head_result.get('z_compensation', 0.0)
         
         result = {
             'position': brick_pos,
             'yaw': brick_yaw,
+            'z_compensation': z_compensation,
             'selected_index': select_index,
             'total_detected': len(masks),
         }
@@ -183,11 +161,14 @@ class GraspPlaceExecutor:
                     all_bricks.append({
                         'position': r['position'].tolist() if hasattr(r['position'], 'tolist') else list(r['position']),
                         'yaw': float(r['yaw']),
+                        'z_compensation': r.get('z_compensation', 0.0),
                     })
             result['all_bricks'] = all_bricks
         
         self._save_result('head', result)
         print(f"  Brick: [{brick_pos[0]:.4f}, {brick_pos[1]:.4f}, {brick_pos[2]:.4f}] m, yaw={np.degrees(brick_yaw):.1f}°")
+        if abs(z_compensation) > 0.001:
+            print(f"  Z compensation applied: {z_compensation*1000:+.1f} mm")
         print(f"  Total detected: {len(masks)}")
         
         return True, result, None
@@ -198,9 +179,15 @@ class GraspPlaceExecutor:
         self,
         brick_position: List[float],
         brick_yaw: float,
+        z_compensation: float = 0.0,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Plan pre-grasp position with LLM and move to hover.
+        
+        Args:
+            brick_position: [x, y, z] brick position (already Z-compensated)
+            brick_yaw: brick yaw angle
+            z_compensation: Z compensation value (for LLM context)
         
         Returns:
             Tuple of (success, result_dict, error_message)
@@ -213,6 +200,7 @@ class GraspPlaceExecutor:
         success, llm_result, error = self.llm_planner.plan_pre_grasp(
             brick_position=brick_position,
             brick_yaw=brick_yaw,
+            z_compensation=z_compensation,
         )
         if not success:
             return False, None, f"LLM planning failed: {error}"
@@ -236,14 +224,16 @@ class GraspPlaceExecutor:
         reference_z: float,
         reference_yaw: float,
         reference_xy: Optional[List[float]] = None,
+        z_compensation: float = 0.0,  # 添加此参数
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Fine positioning using hand-eye camera.
         
         Args:
-            reference_z: Z position from head camera (used as reference)
+            reference_z: Z position from head camera (already compensated, used as reference)
             reference_yaw: Yaw from head camera (used as reference)
             reference_xy: [x, y] position from head camera (used to select closest brick)
+            z_compensation: Z compensation value from head camera (to pass through)
             
         Returns:
             Tuple of (success, result_dict, error_message)
@@ -270,14 +260,12 @@ class GraspPlaceExecutor:
             
             min_dist = float('inf')
             for i, mask in enumerate(masks):
-                # Calculate position for each mask
                 result = self.handeye_calc.compute(
                     mask, handeye_img.shape[:2], arm_pose[0], arm_pose[1],
                     reference_z=reference_z, reference_yaw=reference_yaw
                 )
                 if result is not None:
                     pos = result['position']
-                    # Calculate XY distance to reference
                     dx = pos[0] - reference_xy[0]
                     dy = pos[1] - reference_xy[1]
                     dist = np.sqrt(dx*dx + dy*dy)
@@ -303,7 +291,14 @@ class GraspPlaceExecutor:
         self._save_result('handeye', handeye_result)
         fine_pos = handeye_result['position']
         fine_yaw = handeye_result['yaw']
-        print(f"  Refined: [{fine_pos[0]:.4f}, {fine_pos[1]:.4f}, {fine_pos[2]:.4f}] m, yaw={np.degrees(fine_yaw):.1f}°")
+        
+        # 关键修复：使用头部相机的 Z 值（已含动态补偿），而不是手眼相机计算的 Z
+        # 手眼相机只用于精调 XY，Z 值沿用头部相机的结果
+        fine_pos_corrected = np.array([fine_pos[0], fine_pos[1], reference_z])
+        
+        print(f"  Hand-eye XY: [{fine_pos[0]:.4f}, {fine_pos[1]:.4f}]")
+        print(f"  Using head camera Z (with compensation): {reference_z:.4f} m")
+        print(f"  Final refined: [{fine_pos_corrected[0]:.4f}, {fine_pos_corrected[1]:.4f}, {fine_pos_corrected[2]:.4f}] m, yaw={np.degrees(fine_yaw):.1f}°")
         
         # Validate: refined position should be close to reference
         if reference_xy is not None:
@@ -314,39 +309,43 @@ class GraspPlaceExecutor:
             
             if xy_error > max_allowed_error:
                 print(f"  [Warning] Refined position deviates {xy_error*100:.1f} cm from head camera target")
-                print(f"  [Warning] This might indicate wrong brick selected, but continuing...")
         
         # Fine XY alignment
         current_pos = self.robot_env.get_tcp_position()
         if current_pos is None:
             return False, None, "Cannot get TCP position"
         
-        align_pos = [fine_pos[0], fine_pos[1], current_pos[2]]
+        align_pos = [fine_pos_corrected[0], fine_pos_corrected[1], current_pos[2]]
         if not self.robot_env.move_arm(align_pos, fine_yaw, wait=1.5, check_abort=self._check_abort):
             return False, None, "XY alignment failed"
         
         print("  XY aligned")
         
         return True, {
-            'position': fine_pos,
+            'position': fine_pos_corrected,  # 使用修正后的位置
             'yaw': fine_yaw,
+            'z_compensation': z_compensation,
         }, None
     
-    # ==================== Step 5-6: Descend & Grasp ====================
+    # ==================== Step 5-6: Descend & Grasp (Simplified) ====================
     
     def execute_grasp(
         self,
         brick_position: List[float],
         brick_yaw: float,
-        max_attempts: int = 3,
+        z_compensation: float = 0.0,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
-        Plan descend and execute closed-loop grasp with LLM-driven adaptive learning.
+        Plan descend and execute grasp using DynamicZCompensator.
         
-        The LLM receives compensation history and decides:
-        1. What adjustment to make NOW (delta_z)
-        2. What compensation to recommend for FUTURE grasps
+        The brick_position already includes Z compensation from head camera.
+        No LLM-driven adaptive learning - uses static/dynamic compensation from config.
         
+        Args:
+            brick_position: [x, y, z] brick position (Z already compensated by DynamicZCompensator)
+            brick_yaw: brick yaw angle
+            z_compensation: Z compensation value applied (for logging/LLM context)
+            
         Returns:
             Tuple of (success, result_dict, error_message)
         """
@@ -358,6 +357,7 @@ class GraspPlaceExecutor:
         success, descend_result, error = self.llm_planner.plan_descend(
             brick_position=brick_position,
             brick_yaw=brick_yaw,
+            z_compensation=z_compensation,
         )
         if not success:
             return False, None, f"LLM descend failed: {error}"
@@ -366,152 +366,61 @@ class GraspPlaceExecutor:
         grasp_yaw = descend_result['target_yaw']
         gripper_gap = descend_result['gripper_gap']
         
-        # Store original Z for reference
-        original_grasp_z = grasp_pos[2]
-        
-        # Apply current learned compensation
-        applied_compensation = self._current_compensation
-        if abs(applied_compensation) > 0.001:
-            grasp_pos[2] += applied_compensation
-            print(f"  [LLM Compensation] Applying learned offset: {applied_compensation*1000:+.1f} mm")
-            print(f"  Original Z: {original_grasp_z:.4f} m → Adjusted Z: {grasp_pos[2]:.4f} m")
-        
-        print(f"  Initial grasp pos: [{grasp_pos[0]:.4f}, {grasp_pos[1]:.4f}, {grasp_pos[2]:.4f}] m")
+        print(f"  Grasp position: [{grasp_pos[0]:.4f}, {grasp_pos[1]:.4f}, {grasp_pos[2]:.4f}] m")
+        if abs(z_compensation) > 0.001:
+            print(f"  (Z compensation from DynamicZCompensator: {z_compensation*1000:+.1f} mm)")
         print(f"  Gripper gap: {gripper_gap:.4f} m")
         
-        # Step 6: Closed-loop grasp with LLM learning
-        self._log_step("\n[Step 6/10] Closed-loop grasp with LLM learning...")
+        # Step 6: Execute grasp (single attempt, no retry loop)
+        self._log_step("\n[Step 6/10] Executing grasp...")
         
-        grasp_success = False
+        if self._check_abort():
+            return False, None, "Aborted"
         
-        for attempt in range(1, max_attempts + 1):
-            if self._check_abort():
-                return False, None, "Aborted"
-            
-            print(f"\n  --- Grasp Attempt {attempt}/{max_attempts} ---")
-            print(f"  Target Z: {grasp_pos[2]:.4f} m")
-            if attempt == 1:
-                print(f"  (includes LLM-learned compensation: {applied_compensation*1000:+.1f} mm)")
-            
-            # Open gripper
-            if not self.robot_env.open_gripper(gripper_gap):
-                return False, None, "Open gripper failed"
-            
-            # Descend
-            if not self.robot_env.move_arm(grasp_pos, grasp_yaw, wait=2.0, check_abort=self._check_abort):
-                return False, None, "Descend failed"
-            print("  Descended to grasp position")
-            
-            # Close gripper
-            if not self.robot_env.close_gripper():
-                return False, None, "Close gripper failed"
-            time.sleep(0.3)
-            
-            # Get sensor feedback
-            gripper_state = self.robot_env.get_gripper_state()
-            effort = gripper_state['effort'] or 0.0
-            gap = gripper_state['gap'] or 0.0
-            
-            print(f"  Gripper effort: {effort:.3f} A")
-            print(f"  Gripper gap: {gap:.4f} m")
-            
-            # Get TCP position
-            tcp_pos = self.robot_env.get_tcp_position()
-            tcp_pos_list = tcp_pos.tolist() if tcp_pos is not None else grasp_pos
-            
-            # LLM analyze feedback WITH compensation history
-            print("  Analyzing with LLM (including compensation history)...")
-            success, feedback_result, error = self.llm_planner.analyze_grasp_feedback(
-                brick_position=grasp_pos,
-                brick_yaw=grasp_yaw,
-                tcp_position=tcp_pos_list,
-                gripper_effort=effort,
-                gripper_gap_after_close=gap,
-                attempt_number=attempt,
-                max_attempts=max_attempts,
-                # Pass compensation data to LLM
-                compensation_history=self._compensation_history,
-                current_compensation=self._current_compensation,
-                applied_compensation=applied_compensation,
-            )
-            
-            if not success:
-                print(f"  [Warning] LLM analysis failed: {error}")
-                # Fallback check
-                if effort > 2.0 and gap > 0.03:
-                    print("  [Fallback] Effort and gap indicate success")
-                    grasp_success = True
-                    break
-                continue
-            
-            if feedback_result['grasp_success']:
-                print(f"\n  ✓ GRASP SUCCESSFUL (confidence: {feedback_result['confidence']:.2f})")
-                
-                # Update compensation from LLM's learning output
-                learning = feedback_result.get('learning', {})
-                recommended = learning.get('recommended_compensation', applied_compensation)
-                comp_confidence = learning.get('compensation_confidence', 0.5)
-                
-                self._update_compensation_from_llm(recommended, comp_confidence)
-                
-                grasp_success = True
-                break
-            
-            # Check adjustment
-            adjustment = feedback_result['adjustment']
-            if not adjustment['needed'] or attempt >= max_attempts:
-                print("  ✗ Grasp failed, no more retries")
-                break
-            
-            # Apply LLM's adjustment
-            delta_z = adjustment['delta_z']
-            print(f"  LLM adjustment: Z {delta_z*1000:+.1f} mm ({adjustment['reason']})")
-            grasp_pos[2] += delta_z
-            
-            # Update applied compensation for next attempt
-            applied_compensation = grasp_pos[2] - original_grasp_z
-            print(f"  Total offset from original: {applied_compensation*1000:+.1f} mm")
-            
-            # Open gripper before retry
-            self.robot_env.open_gripper(gripper_gap)
+        # Open gripper
+        if not self.robot_env.open_gripper(gripper_gap):
+            return False, None, "Open gripper failed"
         
-        if not grasp_success:
-            return False, None, "Grasp failed after all attempts"
+        # Descend to grasp position
+        if not self.robot_env.move_arm(grasp_pos, grasp_yaw, wait=2.0, check_abort=self._check_abort):
+            return False, None, "Descend failed"
+        print("  Descended to grasp position")
+        
+        # Close gripper
+        if not self.robot_env.close_gripper():
+            return False, None, "Close gripper failed"
+        time.sleep(0.3)
+        
+        # Check grasp success via sensor feedback
+        gripper_state = self.robot_env.get_gripper_state()
+        effort = gripper_state['effort'] or 0.0
+        gap = gripper_state['gap'] or 0.0
+        
+        print(f"  Gripper effort: {effort:.3f} A")
+        print(f"  Gripper gap: {gap:.4f} m")
+        
+        # Simple success check (same as single_grasp.py)
+        grasp_effort_threshold = 2.0  # Same as GRASP_EFFORT_THRESHOLD in single_grasp.py
+        brick_width = 0.05  # Default brick width
+        
+        grasp_success = (effort > grasp_effort_threshold) and (gap > brick_width * 0.5)
+        
+        if grasp_success:
+            print(f"\n  ✓ GRASP SUCCESSFUL!")
+        else:
+            if effort < grasp_effort_threshold:
+                print(f"\n  ✗ Grasp failed: effort too low ({effort:.3f} A < {grasp_effort_threshold} A)")
+            else:
+                print(f"\n  ✗ Grasp failed: gap too small ({gap:.4f} m)")
+            return False, None, "Grasp failed - check Z compensation calibration"
         
         return True, {
             'grasp_position': grasp_pos,
             'grasp_yaw': grasp_yaw,
-            'compensation_applied': applied_compensation,
-            'compensation_learned': self._current_compensation,
+            'z_compensation': z_compensation,
+            'effort': effort,
+            'gap': gap,
         }, None
-    
-    def _update_compensation_from_llm(self, recommended: float, confidence: float):
-        """
-        Update compensation based on LLM's recommendation.
-        
-        Uses weighted update based on confidence.
-        """
-        # Add to history
-        self._compensation_history.append(recommended)
-        if len(self._compensation_history) > self._max_history_size:
-            self._compensation_history.pop(0)
-        
-        # Update current compensation with weighted average
-        # Higher confidence = more weight to new recommendation
-        if confidence > 0.7:
-            # High confidence: use new value directly
-            self._current_compensation = recommended
-        elif confidence > 0.4:
-            # Medium confidence: blend with current
-            self._current_compensation = 0.7 * recommended + 0.3 * self._current_compensation
-        else:
-            # Low confidence: small update
-            self._current_compensation = 0.3 * recommended + 0.7 * self._current_compensation
-        
-        print(f"\n  [LLM Learning] Updated compensation:")
-        print(f"    Recommended: {recommended*1000:+.1f} mm (confidence: {confidence:.2f})")
-        print(f"    New baseline: {self._current_compensation*1000:+.1f} mm")
-        print(f"    History: {[f'{c*1000:.1f}' for c in self._compensation_history[-5:]]} mm")
     
     # ==================== Step 7: Lift ====================
     
@@ -622,6 +531,10 @@ class GraspPlaceExecutor:
         """
         Descend to place surface and release with closed-loop control.
         
+        Uses two contact detection methods:
+        1. Z position error (z_error > threshold_mm)
+        2. Arm effort (total arm current > effort_threshold)
+        
         Args:
             place_yaw: Yaw angle for placement
             target_surface_z: Target Z height for placement (if None, use config)
@@ -668,12 +581,18 @@ class GraspPlaceExecutor:
             return False, None, "Aborted"
         
         print("\n  === Closed-Loop Placement ===")
-        print("  Detecting surface contact via Z position error...")
+        print("  Detecting surface contact via Z position error AND arm effort...")
         
-        max_release_attempts = 10
-        contact_threshold_mm = 0.3
-        descend_step = 0.005
-        lift_step = 0.01
+        # ========== 从配置文件读取参数 ==========
+        release_config = self.llm_planner.config.get("release", {})
+        max_release_attempts = release_config.get("max_attempts", 10)
+        contact_threshold_mm = release_config.get("contact_threshold_mm", 0.8)
+        descend_step = release_config.get("descend_step", 0.005)
+        lift_step = release_config.get("lift_step", 0.01)
+        arm_effort_threshold = release_config.get("arm_effort_threshold", 12.0)
+        
+        print(f"  Config: z_threshold={contact_threshold_mm:.1f}mm, effort_threshold={arm_effort_threshold:.1f}A")
+        print(f"          descend={descend_step*1000:.1f}mm, lift={lift_step*1000:.1f}mm")
         
         current_place_pos = list(final_place_pos)
         
@@ -691,10 +610,23 @@ class GraspPlaceExecutor:
             z_error = actual_z - target_z
             z_error_mm = z_error * 1000
             
+            # 获取整臂电流
+            arm_effort = self.robot_env.get_arm_total_effort()
+            arm_effort_str = f"{arm_effort:.2f}A" if arm_effort is not None else "N/A"
+            
             print(f"\n  --- Release Attempt {attempt}/{max_release_attempts} ---")
             print(f"  Actual Z: {actual_z:.4f} m, Target Z: {target_z:.4f} m, Error: {z_error_mm:+.1f} mm")
+            print(f"  Arm total effort: {arm_effort_str}")
             
-            # LLM analyze release feedback
+            # ========== 优先检查电流阈值 ==========
+            if arm_effort is not None and arm_effort > arm_effort_threshold:
+                print(f"  ✓ ARM EFFORT EXCEEDED ({arm_effort:.2f}A > {arm_effort_threshold:.1f}A)")
+                print(f"    Lifting {lift_step*1000:.1f} mm before release...")
+                current_place_pos[2] += lift_step
+                self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
+                break
+            
+            # ========== LLM 分析 release feedback ==========
             success, release_result, error = self.llm_planner.analyze_release_feedback(
                 actual_z=actual_z,
                 target_z=target_z,
@@ -703,13 +635,17 @@ class GraspPlaceExecutor:
                 lift_step=lift_step,
                 attempt_number=attempt,
                 max_attempts=max_release_attempts,
+                arm_effort=arm_effort,
+                arm_effort_threshold=arm_effort_threshold,
             )
             
             if not success:
                 print(f"  [Warning] LLM release analysis failed: {error}")
-                # Fallback
+                # Fallback: 检查 Z 误差或电流
                 if z_error_mm > contact_threshold_mm:
-                    print("  [Fallback] Contact detected, releasing...")
+                    print("  [Fallback] Z contact detected, releasing...")
+                    current_place_pos[2] += lift_step
+                    self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
                     break
                 else:
                     current_place_pos[2] -= descend_step
@@ -766,6 +702,8 @@ class GraspPlaceExecutor:
         """
         Execute a complete grasp-place cycle.
         
+        Uses DynamicZCompensator from head_calc for Z correction.
+        
         Args:
             rgb: RGB image from head camera
             depth: Depth image from head camera
@@ -776,27 +714,38 @@ class GraspPlaceExecutor:
             Tuple of (success, error_message)
         """
         print("\n" + "=" * 60)
-        print("[Task Started] LLM Closed-Loop Grasp-Place")
+        print("[Task Started] LLM Grasp-Place with DynamicZCompensator")
         print("=" * 60)
         
-        # Step 1: Head camera detection
+        # Step 1: Head camera detection (includes DynamicZCompensator)
         success, head_result, error = self.detect_with_head_camera(rgb, depth, brick_index)
         if not success:
             return False, f"Detection failed: {error}"
         
         brick_pos = head_result['position']
         brick_yaw = head_result['yaw']
+        z_compensation = head_result.get('z_compensation', 0.0)
         brick_pos_list = brick_pos.tolist() if hasattr(brick_pos, 'tolist') else list(brick_pos)
         
+        print(f"\n[Debug] Head camera result:")
+        print(f"  Position: {brick_pos_list}")
+        print(f"  Z compensation applied: {z_compensation*1000:+.1f} mm")
+        
         # Step 2-3: Plan and move to hover
-        success, _, error = self.plan_and_move_to_hover(brick_pos_list, float(brick_yaw))
+        success, _, error = self.plan_and_move_to_hover(
+            brick_pos_list, float(brick_yaw), z_compensation
+        )
         if not success:
             return False, error
         
-        # Step 4: Hand-eye fine positioning (pass reference_xy for multi-brick selection)
+        # Step 4: Hand-eye fine positioning
+        # 关键：传入 z_compensation，并且使用 brick_pos[2]（已含补偿）作为 reference_z
         reference_xy = [brick_pos_list[0], brick_pos_list[1]]
         success, fine_result, error = self.fine_position_with_handeye(
-            brick_pos[2], brick_yaw, reference_xy=reference_xy
+            reference_z=brick_pos_list[2],  # 头部相机的 Z（已含动态补偿）
+            reference_yaw=brick_yaw,
+            reference_xy=reference_xy,
+            z_compensation=z_compensation,
         )
         if not success:
             return False, error
@@ -805,8 +754,14 @@ class GraspPlaceExecutor:
         fine_yaw = fine_result['yaw']
         fine_pos_list = fine_pos.tolist() if hasattr(fine_pos, 'tolist') else list(fine_pos)
         
-        # Step 5-6: Grasp
-        success, grasp_result, error = self.execute_grasp(fine_pos_list, float(fine_yaw))
+        print(f"\n[Debug] Fine positioning result:")
+        print(f"  Position: {fine_pos_list}")
+        print(f"  Z (from head camera with compensation): {fine_pos_list[2]:.4f} m")
+        
+        # Step 5-6: Grasp (uses Z compensation from head camera)
+        success, grasp_result, error = self.execute_grasp(
+            fine_pos_list, float(fine_yaw), z_compensation
+        )
         if not success:
             return False, error
         

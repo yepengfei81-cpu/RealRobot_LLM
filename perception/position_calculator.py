@@ -24,6 +24,70 @@ HEAD_INTRINSICS = {
 }
 
 
+# ==================== Dynamic Z Compensator ====================
+
+class DynamicZCompensator:
+    """Dynamic Z-axis Compensator - same as in single_grasp.py"""
+    
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.model_type = "linear"
+        self.coefficients = {
+            'intercept': 0.0,
+            'x_coeff': 0.0,
+            'y_coeff': 0.0,
+            'xy_coeff': 0.0,
+            'x2_coeff': 0.0,
+            'y2_coeff': 0.0,
+        }
+        self.enabled = False
+        self._load_config()
+    
+    def _load_config(self):
+        """Load from config file"""
+        if not self.config_path.exists():
+            print(f"[Z-Comp] Config file not found: {self.config_path}")
+            return
+        
+        try:
+            with open(self.config_path) as f:
+                data = json.load(f)
+            
+            dz = data.get('dynamic_z_compensation', {})
+            self.enabled = dz.get('enabled', False)
+            self.model_type = dz.get('model', 'linear')
+            self.coefficients = dz.get('coefficients', self.coefficients)
+            
+            if self.enabled:
+                print(f"[Z-Comp] Loaded dynamic compensation model: {self.model_type}")
+                print(f"[Z-Comp] Coefficients: intercept={self.coefficients.get('intercept', 0):.4f}, "
+                      f"x={self.coefficients.get('x_coeff', 0):.4f}, y={self.coefficients.get('y_coeff', 0):.4f}")
+            else:
+                print("[Z-Comp] Dynamic compensation disabled in config")
+        except Exception as e:
+            print(f"[Z-Comp] Failed to load config: {e}")
+    
+    def compute_compensation(self, x: float, y: float) -> float:
+        """Compute Z compensation value based on X, Y coordinates"""
+        if not self.enabled:
+            return 0.0
+        
+        c = self.coefficients
+        
+        if self.model_type == "linear":
+            return c.get('intercept', 0.0) + c.get('x_coeff', 0.0) * x + c.get('y_coeff', 0.0) * y
+        
+        elif self.model_type == "quadratic":
+            return (c.get('intercept', 0.0) + 
+                    c.get('x_coeff', 0.0) * x + 
+                    c.get('y_coeff', 0.0) * y +
+                    c.get('xy_coeff', 0.0) * x * y +
+                    c.get('x2_coeff', 0.0) * x * x +
+                    c.get('y2_coeff', 0.0) * y * y)
+        
+        return 0.0
+
+
 # ==================== Utility Functions ====================
 
 def estimate_orientation(mask: np.ndarray) -> float:
@@ -77,14 +141,20 @@ class HeadCameraCalculator:
     - Segmentation mask
     - Depth image
     - Camera TF transform
+    - Dynamic Z compensation
     """
     
-    def __init__(self, intrinsics: Optional[Dict] = None):
+    def __init__(
+        self, 
+        intrinsics: Optional[Dict] = None,
+        z_compensator: Optional[DynamicZCompensator] = None,
+    ):
         """
         Initialize calculator.
         
         Args:
             intrinsics: camera intrinsics dict with fx, fy, cx, cy
+            z_compensator: DynamicZCompensator for Z-axis correction
         """
         if intrinsics is None:
             intrinsics = HEAD_INTRINSICS
@@ -94,14 +164,26 @@ class HeadCameraCalculator:
         self.cx = intrinsics['cx']
         self.cy = intrinsics['cy']
         
+        # Z compensator
+        self.z_compensator = z_compensator
+        
         # Load static offset
         self.offset = np.zeros(3)
         offset_path = CALIB_DIR / "head_camera_offset.json"
         if offset_path.exists():
-            with open(offset_path) as f:
-                data = json.load(f)
-                self.offset = np.array(data.get('offset_xyz', [0, 0, 0]))
-                print(f"[HeadCalc] Static offset: {self.offset}")
+            try:
+                with open(offset_path) as f:
+                    data = json.load(f)
+                    self.offset = np.array(data.get('offset_xyz', [0, 0, 0]))
+                    print(f"[HeadCalc] Static offset: X={self.offset[0]:+.4f}, Y={self.offset[1]:+.4f}, Z={self.offset[2]:+.4f}")
+            except Exception as e:
+                print(f"[HeadCalc] Failed to load offset: {e}")
+        
+        # Print Z compensator status
+        if self.z_compensator is not None and self.z_compensator.enabled:
+            print(f"[HeadCalc] DynamicZCompensator: ENABLED ({self.z_compensator.model_type})")
+        else:
+            print("[HeadCalc] DynamicZCompensator: DISABLED")
     
     def compute(
         self, 
@@ -118,7 +200,7 @@ class HeadCameraCalculator:
             tf_matrix: 4x4 transform from camera to base_link
             
         Returns:
-            Dictionary with 'position' and 'yaw' or None if failed
+            Dictionary with 'position', 'yaw', and 'z_compensation' or None if failed
         """
         h, w = depth.shape
         
@@ -166,13 +248,24 @@ class HeadCameraCalculator:
         # Transform yaw to base frame
         yaw_base = yaw_cam + np.arctan2(tf_matrix[1, 0], tf_matrix[0, 0]) + np.pi
         
+        # ========== Apply Dynamic Z Compensation ==========
+        z_compensation = 0.0
+        if self.z_compensator is not None and self.z_compensator.enabled:
+            z_compensation = self.z_compensator.compute_compensation(pos_base[0], pos_base[1])
+            pos_base[2] += z_compensation
+            print(f"[HeadCalc] Z compensation: {z_compensation*1000:+.1f} mm at X={pos_base[0]:.3f}, Y={pos_base[1]:.3f}")
+        
         # Normalize yaw
         while yaw_base > np.pi:
             yaw_base -= 2 * np.pi
         while yaw_base < -np.pi:
             yaw_base += 2 * np.pi
         
-        return {'position': pos_base, 'yaw': yaw_base}
+        return {
+            'position': pos_base, 
+            'yaw': yaw_base,
+            'z_compensation': z_compensation,
+        }
 
 
 # ==================== Hand-Eye Camera Calculator ====================
@@ -220,7 +313,7 @@ class HandEyeCalculator:
             shape: image shape (h, w)
             R_g2b: gripper-to-base rotation matrix
             t_g2b: gripper-to-base translation
-            reference_z: Z coordinate from head camera
+            reference_z: Z coordinate from head camera (already compensated)
             reference_yaw: yaw from head camera
             
         Returns:
@@ -304,9 +397,32 @@ class HandEyeCalculator:
 
 # ==================== Factory Functions ====================
 
-def create_head_calculator(intrinsics: Optional[Dict] = None) -> HeadCameraCalculator:
-    """Create head camera calculator."""
-    return HeadCameraCalculator(intrinsics)
+def create_head_calculator(
+    intrinsics: Optional[Dict] = None,
+    calib_dir: Optional[Path] = None,
+    enable_z_compensation: bool = True,
+) -> HeadCameraCalculator:
+    """
+    Create head camera calculator with optional Z compensation.
+    
+    Args:
+        intrinsics: camera intrinsics (optional)
+        calib_dir: calibration directory path
+        enable_z_compensation: whether to enable dynamic Z compensation
+        
+    Returns:
+        HeadCameraCalculator instance
+    """
+    if calib_dir is None:
+        calib_dir = CALIB_DIR
+    
+    # Create Z compensator if enabled
+    z_compensator = None
+    if enable_z_compensation:
+        offset_path = calib_dir / "head_camera_offset.json"
+        z_compensator = DynamicZCompensator(offset_path)
+    
+    return HeadCameraCalculator(intrinsics=intrinsics, z_compensator=z_compensator)
 
 
 def create_handeye_calculator(

@@ -127,6 +127,7 @@ class LLMGraspPlanner:
         tcp_position: Optional[List[float]] = None,
         tcp_orientation: Optional[List[float]] = None,
         brick_size: Optional[List[float]] = None,
+        z_compensation: float = 0.0,
         attempt_idx: int = 0,
         feedback: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
@@ -137,10 +138,12 @@ class LLMGraspPlanner:
         
         Args:
             brick_position: [x, y, z] brick center position in base_link frame (meters)
+                           Note: Z is already compensated by DynamicZCompensator
             brick_yaw: brick yaw angle in radians
             tcp_position: [x, y, z] current TCP position (optional)
             tcp_orientation: [roll, pitch, yaw] current TCP orientation (optional)
             brick_size: [L, W, H] brick dimensions (optional, uses config default)
+            z_compensation: Z compensation value applied by DynamicZCompensator (for context)
             attempt_idx: Retry attempt number
             feedback: Error feedback from previous attempt
             
@@ -165,6 +168,7 @@ class LLMGraspPlanner:
             brick_size=brick_size,
             hover_height=self.hover_height,
             gripper_max_opening=self.gripper_max_opening,
+            z_compensation=z_compensation,
         )
         
         # Generate prompt
@@ -243,6 +247,7 @@ class LLMGraspPlanner:
         brick_yaw: float,
         tcp_position: Optional[List[float]] = None,
         brick_size: Optional[List[float]] = None,
+        z_compensation: float = 0.0,
         attempt_idx: int = 0,
         feedback: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
@@ -251,9 +256,11 @@ class LLMGraspPlanner:
         
         Args:
             brick_position: [x, y, z] - brick TOP SURFACE position from hand-eye camera
+                           Note: Z is already compensated by DynamicZCompensator
             brick_yaw: brick yaw angle in radians
             tcp_position: current TCP position (optional)
             brick_size: [L, W, H] brick dimensions (optional, uses config default)
+            z_compensation: Z compensation value applied by DynamicZCompensator (for context)
             attempt_idx: Retry attempt number
             feedback: Error feedback from previous attempt
             
@@ -273,6 +280,7 @@ class LLMGraspPlanner:
             brick_size=brick_size,
             gripper_max_opening=self.gripper_max_opening,
             gripper_clearance=self.gripper_clearance,
+            z_compensation=z_compensation,
         )
         
         # Generate prompt
@@ -836,11 +844,13 @@ class LLMGraspPlanner:
         self,
         actual_z: float,
         target_z: float,
-        contact_threshold_mm: float = 0.3,
+        contact_threshold_mm: float = 0.8,
         descend_step: float = 0.005,
         lift_step: float = 0.01,
         attempt_number: int = 1,
         max_attempts: int = 10,
+        arm_effort: Optional[float] = None,
+        arm_effort_threshold: float = 12.0,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Analyze placement feedback and decide release action.
@@ -853,20 +863,15 @@ class LLMGraspPlanner:
             lift_step: Step size for lifting before release (meters)
             attempt_number: Current attempt number
             max_attempts: Maximum attempts
+            arm_effort: Total arm effort/current (Amps), None if unavailable
+            arm_effort_threshold: Threshold for effort-based contact detection (Amps)
             
         Returns:
             Tuple of (success, result_dict, error_message)
-            
-            result_dict contains:
-            - contact_detected: bool
-            - confidence: float
-            - analysis: {z_error_mm, contact_state}
-            - action: {type, delta_z, reason}
-            - reasoning: str
         """
         from .prompts import get_release_prompt, build_release_context
         
-        # Build context
+        # Build context with arm effort
         context = build_release_context(
             actual_z=actual_z,
             target_z=target_z,
@@ -875,6 +880,8 @@ class LLMGraspPlanner:
             lift_step=lift_step,
             attempt_number=attempt_number,
             max_attempts=max_attempts,
+            arm_effort=arm_effort,
+            arm_effort_threshold=arm_effort_threshold,
         )
         
         # Generate prompt

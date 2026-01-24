@@ -570,6 +570,11 @@ class BrickDetector:
         self.offset_step = 0.005
         self._pending_head_offset = None
         
+        # 手眼外参校准
+        self._handeye_calib_mode = False
+        self._handeye_calib_initial_pos = None  # 手眼检测的初始位置
+        self._handeye_calib_initial_yaw = None
+        
         # Z补偿标定模式
         self._calibration_mode = False
         self._calibration_detected_pos = None  # 检测到的位置（未补偿）
@@ -587,11 +592,15 @@ class BrickDetector:
         print("  l - 抬升  m - 移动到放置位置  n - 下降放置  o - 打开夹爪")
         print("  p - 打印位姿  r - 重置  q - 退出")
         print("-" * 60)
-        print("Z轴动态补偿标定 (新功能):")
-        print("  b - 开始/结束标定模式")
-        print("  v - 添加当前位置为标定点（需先按s检测，然后56调整到对准）")
-        print("  7 - 使用线性模型拟合  8 - 使用二次模型拟合")
-        print("  9 - 清除所有标定点  0 - 显示补偿状态")
+        print("Z轴动态补偿标定:")
+        print("  b - 开始/结束Z补偿标定模式")
+        print("  v - 添加当前位置为标定点")
+        print("  7 - 线性模型拟合  8 - 二次模型拟合")
+        print("  9 - 清除标定点  0 - 显示补偿状态")
+        print("-" * 60)
+        print("手眼外参校准 (新功能):")
+        print("  c - 开始/结束手眼外参校准模式")
+        print("  x - 保存校准后的手眼外参")
         print("-" * 60)
         print("手动微调 (步进5mm):")
         print("  1/2 - Y轴 左/右  3/4 - X轴 前/后  5/6 - Z轴 上/下")
@@ -722,6 +731,149 @@ class BrickDetector:
         self._handeye_frame = img.copy()
         self._handeye_until = time.time() + 5
 
+    def _toggle_handeye_calib_mode(self):
+        """切换手眼外参校准模式"""
+        self._handeye_calib_mode = not self._handeye_calib_mode
+        
+        if self._handeye_calib_mode:
+            print("\n" + "=" * 60)
+            print("[手眼外参校准模式] 已开启")
+            print("-" * 60)
+            print("校准步骤:")
+            print("  1. 按 's' 进行头部检测")
+            print("  2. 按 'g' 移动机械臂到检测位置上方")
+            print("  3. 按 'e' 进行手眼分割（记录手眼检测的 XY）")
+            print("  4. 按 'f' 移动到手眼检测的 XY 位置")
+            print("  5. 按 'd' 下降到砖块")
+            print("  6. 用 1234 微调 XY，直到夹爪精确对准砖块中心")
+            print("  7. 按 'x' 保存校准（只计算 XY 偏移，忽略 Z）")
+            print("  8. 按 'c' 退出校准模式")
+            print("-" * 60)
+            print("原理: 手眼相机只提供 XY 定位，Z 来自头部相机")
+            print("      所以只校准 XY 偏移，不管 Z 变化")
+            print("=" * 60)
+            
+            self._handeye_calib_initial_pos = None
+            self._handeye_calib_initial_yaw = None
+        else:
+            print("\n[手眼外参校准模式] 已关闭")
+            self._handeye_calib_initial_pos = None
+            self._handeye_calib_initial_yaw = None
+
+    def _save_handeye_calibration(self):
+        """保存手眼外参校准结果 - 使用与可用版本相同的计算方法"""
+        if not self._handeye_calib_mode:
+            print("[手眼校准] 请先按 'c' 进入校准模式")
+            return
+        
+        if self._handeye_calib_initial_pos is None:
+            print("[手眼校准] 请先按 'e' 手眼分割，再按 'f' 移动")
+            return
+        
+        # 获取当前夹爪位姿
+        poses = self.robot.get_arm_end_poses()
+        if not poses or self.arm_key not in poses:
+            print("[手眼校准] 无法获取当前位姿")
+            return
+        
+        current = poses[self.arm_key]
+        current_pos = np.array(current['position'])
+        current_quat = current['orientation']
+        
+        # 只计算 XY 偏移（手眼相机只负责 XY 定位）
+        offset_x = current_pos[0] - self._handeye_calib_initial_pos[0]
+        offset_y = current_pos[1] - self._handeye_calib_initial_pos[1]
+        
+        print("\n" + "=" * 70)
+        print("[手眼外参校准结果]")
+        print("-" * 70)
+        print(f"  手眼检测 XY: [{self._handeye_calib_initial_pos[0]:.4f}, {self._handeye_calib_initial_pos[1]:.4f}]")
+        print(f"  实际夹爪 XY: [{current_pos[0]:.4f}, {current_pos[1]:.4f}]")
+        print(f"  XY 偏移:     [ΔX={offset_x:+.4f}, ΔY={offset_y:+.4f}]")
+        print(f"  偏移距离:    {np.sqrt(offset_x**2 + offset_y**2)*1000:.1f} mm")
+        print("-" * 70)
+        
+        # === 使用与可用版本相同的坐标转换方法 ===
+        
+        # 当前夹爪姿态
+        R_g2b = R.from_quat(current_quat).as_matrix()
+        t_g2b = current_pos
+        print(f"  夹爪位置 (base): [{t_g2b[0]:.4f}, {t_g2b[1]:.4f}, {t_g2b[2]:.4f}]")
+        euler_g = R.from_quat(current_quat).as_euler('xyz', degrees=True)
+        print(f"  夹爪欧拉角:      [{euler_g[0]:.1f}, {euler_g[1]:.1f}, {euler_g[2]:.1f}]°")
+        
+        # base_link 下的补偿向量 (Z=0，只校准XY)
+        offset_base = np.array([offset_x, offset_y, 0.0])
+        print(f"  补偿向量 (base): [{offset_base[0]:+.4f}, {offset_base[1]:+.4f}, {offset_base[2]:+.4f}]")
+        
+        # 转换到夹爪坐标系: offset_gripper = R_g2b^T @ offset_base
+        offset_gripper = R_g2b.T @ offset_base
+        print(f"  补偿向量 (gripper): [{offset_gripper[0]:+.4f}, {offset_gripper[1]:+.4f}, {offset_gripper[2]:+.4f}]")
+        
+        # 更新手眼外参
+        side = "left" if self.use_left else "right"
+        extr_path = CALIB_DIR / f"hand_eye_extrinsics_{side}.json"
+        
+        try:
+            with open(extr_path) as f:
+                extr = json.load(f)
+            
+            # 当前外参 translation
+            current_trans = np.array(extr['translation'])
+            print(f"\n  当前外参 translation: [{current_trans[0]:.4f}, {current_trans[1]:.4f}, {current_trans[2]:.4f}]")
+            
+            # 新外参 translation = 当前 + gripper坐标系下的偏移
+            # 注意：这里直接加 offset_gripper，因为 translation 是在 gripper 坐标系下定义的
+            new_trans = current_trans + offset_gripper
+            print(f"  建议新 translation:  [{new_trans[0]:.4f}, {new_trans[1]:.4f}, {new_trans[2]:.4f}]")
+            
+            print("-" * 70)
+            print("按 'y' 确认保存，其他键取消")
+            
+            self._pending_handeye_save = {
+                'path': extr_path,
+                'old_extr': extr,
+                'new_translation': new_trans.tolist(),
+                'offset_xy': [offset_x, offset_y],
+                'offset_gripper': offset_gripper.tolist(),
+            }
+            
+        except Exception as e:
+            print(f"[手眼校准] 读取外参失败: {e}")
+
+    def _confirm_handeye_save(self):
+        """确认保存手眼外参"""
+        if not hasattr(self, '_pending_handeye_save') or self._pending_handeye_save is None:
+            return False
+        
+        save_info = self._pending_handeye_save
+        extr = save_info['old_extr']
+        extr['translation'] = save_info['new_translation']
+        
+        # 备份旧文件
+        backup_path = save_info['path'].with_suffix('.json.bak')
+        import shutil
+        shutil.copy(save_info['path'], backup_path)
+        print(f"  [备份] 已保存到 {backup_path}")
+        
+        # 保存新外参
+        with open(save_info['path'], 'w') as f:
+            json.dump(extr, f, indent=2)
+        
+        print(f"  [保存] 新外参已保存到 {save_info['path']}")
+        print("=" * 60)
+        
+        # 重新加载手眼计算器
+        side = "left" if self.use_left else "right"
+        intr_path = CALIB_DIR / f"hand_eye_intrinsics_{side}.json"
+        with open(intr_path) as f:
+            intr = json.load(f)
+        self.handeye_calc = HandEyeCalculator(intr, extr)
+        print("[手眼校准] 已重新加载手眼计算器")
+        
+        self._pending_handeye_save = None
+        return True
+    
     def _move_arm(self):
         if not self._head_results:
             print("[移动] 请先按 's' 检测")
@@ -766,12 +918,22 @@ class BrickDetector:
         
         print(f"\n[精确移动] 使用手眼 XY，保持当前高度")
         
+        # 如果在手眼校准模式，记录手眼检测的 XY 位置
+        if self._handeye_calib_mode:
+            # 只记录 XY，这是手眼相机实际检测的
+            self._handeye_calib_initial_pos = np.array([
+                handeye_pos[0],  # 手眼检测的 X
+                handeye_pos[1],  # 手眼检测的 Y
+            ])
+            self._handeye_calib_initial_yaw = handeye_yaw
+            print(f"[手眼校准] 已记录手眼检测 XY: [{handeye_pos[0]:.4f}, {handeye_pos[1]:.4f}]")
+            print(f"[手眼校准] 按 'd' 下降后用 1234 微调 XY，然后按 'x' 保存")
+        
         self.arm_controller.move_to_hover(
             brick_position=compensated_pos,
             brick_yaw=handeye_yaw,
             hover_height=hover_height
         )
-
     def _move_gripper_z(self, delta_z: float):
         """控制夹爪在 Z 轴方向移动"""
         poses = self.robot.get_arm_end_poses()
@@ -1125,10 +1287,18 @@ class BrickDetector:
             
             # 标定模式指示
             if self._calibration_mode:
-                cv2.putText(disp, "[CALIBRATION MODE]", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(disp, "[Z-CALIBRATION MODE]", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.putText(disp, f"Points: {len(self.z_compensator.calibration_points)}", (10, 90), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             
+            # 手眼校准模式指示
+            if self._handeye_calib_mode:
+                cv2.putText(disp, "[HANDEYE-CALIB MODE]", (10, 120 if self._calibration_mode else 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                if self._handeye_calib_initial_pos is not None:
+                    cv2.putText(disp, f"Init: [{self._handeye_calib_initial_pos[0]:.3f}, {self._handeye_calib_initial_pos[1]:.3f}]", 
+                               (10, 150 if self._calibration_mode else 90), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
             # Z补偿状态
             if self.z_compensator.enabled:
                 cv2.putText(disp, f"Z-Comp: ON ({self.z_compensator.model_type})", (10, disp.shape[0]-10), 
@@ -1146,14 +1316,27 @@ class BrickDetector:
                 
                 offset_text = f"Offset: X={self.handeye_offset['x']:+.3f} Y={self.handeye_offset['y']:+.3f}"
                 cv2.putText(he_disp, offset_text, (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                
+                # 手眼校准模式显示
+                if self._handeye_calib_mode:
+                    cv2.putText(he_disp, "[HANDEYE-CALIB]", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                    cv2.putText(he_disp, "1234:XY adjust, x:save", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                
                 cv2.imshow("HandEye", he_disp)
             
             # 按键处理
             k = cv2.waitKey(1) & 0xFF
+            if hasattr(self, '_pending_handeye_save') and self._pending_handeye_save is not None:
+                if k == ord('y'):
+                    self._confirm_handeye_save()
+                    continue
+                elif k != 255:  # 任何其他键取消
+                    print("[手眼校准] 已取消保存")
+                    self._pending_handeye_save = None
+                    continue
             
             # 基本操作
             if k == ord('s') and depth is not None:
-                # 在标定模式下，不应用动态补偿
                 self._head_detect(rgb, depth, apply_compensation=not self._calibration_mode)
             elif k == ord('g'):
                 self._move_arm()
@@ -1177,7 +1360,6 @@ class BrickDetector:
                 self._descend_and_place()
             elif k == ord('r'):
                 self._reset()
-            
             # 手动微调
             elif k == ord('1'):  # Y+
                 self._move_gripper_xy(0, self.offset_step)
@@ -1206,12 +1388,16 @@ class BrickDetector:
             elif k == ord('0'):
                 self.z_compensator.print_status()
             
+            # 手眼外参校准
+            elif k == ord('c'):
+                self._toggle_handeye_calib_mode()
+            elif k == ord('x'):
+
+                self._save_handeye_calibration()
             elif k in (ord('q'), 27):
                 break
-        
         cv2.destroyAllWindows()
         self.tf_client.disconnect()
-
 
 def main():
     parser = argparse.ArgumentParser()

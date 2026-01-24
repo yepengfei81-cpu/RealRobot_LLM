@@ -184,69 +184,46 @@ def get_pre_grasp_prompt(context: Dict[str, Any],
                          feedback: Optional[str] = None) -> Tuple[str, str]:
     """
     Generate pre-grasp prompt for real robot.
-    
-    Args:
-        context: Dictionary containing:
-            - robot: {dof, ...}
-            - gripper: {max_opening, state, ...}
-            - brick: {position: [x,y,z], size_LWH: [L,W,H], yaw: float}
-            - tcp: {x, y, z, roll, pitch, yaw}
-            - constraints: {hover_height, safety_clearance, ...}
-        attempt_idx: Retry attempt number
-        feedback: Error feedback from previous attempt
-        
-    Returns:
-        Tuple of (system_prompt, user_prompt)
-    
-    Example context:
-        context = {
-            "robot": {"dof": 6},
-            "gripper": {"max_opening": 0.08, "state": "open"},
-            "brick": {
-                "position": [0.35, 0.15, 0.03],
-                "size_LWH": [0.20, 0.095, 0.06],
-                "yaw": 0.5
-            },
-            "tcp": {"x": 0.2, "y": 0.0, "z": 0.3, "roll": 0, "pitch": 0, "yaw": 0},
-            "constraints": {"hover_height": 0.15, "safety_clearance": 0.05}
-        }
     """
     builder = PreGraspPromptBuilder(context, attempt_idx, feedback)
     return builder.build()
-
-
-# ==================== Context Builder Helper ====================
 
 def build_pre_grasp_context(
     brick_position: List[float],
     brick_yaw: float,
     tcp_position: Optional[List[float]] = None,
     tcp_orientation: Optional[List[float]] = None,
-    brick_size: List[float] = None,
+    brick_size: Optional[List[float]] = None,
     hover_height: float = 0.15,
     gripper_max_opening: float = 0.08,
+    z_compensation: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Helper function to build context dictionary for pre-grasp prompt.
+    Build context dictionary for pre-grasp prompt.
     
     Args:
-        brick_position: [x, y, z] brick center position in meters
+        brick_position: [x, y, z] brick center position in base_link frame (meters)
+                       Note: Z is already compensated by DynamicZCompensator
         brick_yaw: brick yaw angle in radians
         tcp_position: [x, y, z] current TCP position (optional)
         tcp_orientation: [roll, pitch, yaw] current TCP orientation (optional)
-        brick_size: [L, W, H] brick dimensions (default: standard brick)
-        hover_height: height to hover above brick top
-        gripper_max_opening: maximum gripper opening width
+        brick_size: [L, W, H] brick dimensions (optional, uses default)
+        hover_height: height above brick for hover position (meters)
+        gripper_max_opening: maximum gripper opening (meters)
+        z_compensation: Z compensation value applied by DynamicZCompensator (for context)
         
     Returns:
-        Context dictionary ready for get_pre_grasp_prompt()
+        Context dictionary for prompt builder
     """
+    # Default brick size
     if brick_size is None:
-        brick_size = [0.20, 0.095, 0.06]  # Standard brick size
+        brick_size = [0.11, 0.05, 0.025]  # L, W, H
     
+    # Default TCP position if not provided
     if tcp_position is None:
-        tcp_position = [0.2, 0.0, 0.3]
+        tcp_position = [0.4, 0.0, 1.0]
     
+    # Default TCP orientation if not provided  
     if tcp_orientation is None:
         tcp_orientation = [0.0, 0.0, 0.0]
     
@@ -256,7 +233,6 @@ def build_pre_grasp_context(
         },
         "gripper": {
             "max_opening": gripper_max_opening,
-            "state": "open",
         },
         "brick": {
             "position": brick_position,
@@ -271,8 +247,6 @@ def build_pre_grasp_context(
             "pitch": tcp_orientation[1],
             "yaw": tcp_orientation[2],
         },
-        "constraints": {
-            "hover_height": hover_height,
-            "safety_clearance": 0.05,
-        },
+        "hover_height": hover_height,
+        "z_compensation": z_compensation,
     }

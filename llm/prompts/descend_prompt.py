@@ -218,34 +218,34 @@ def build_descend_context(
     brick_position: List[float],
     brick_yaw: float,
     tcp_position: Optional[List[float]] = None,
-    tcp_orientation: Optional[List[float]] = None,
-    brick_size: List[float] = None,
+    brick_size: Optional[List[float]] = None,
     gripper_max_opening: float = 0.08,
     gripper_clearance: float = 0.01,
+    z_compensation: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Helper function to build context dictionary for descend prompt.
+    Build context dictionary for descend prompt.
     
     Args:
-        brick_position: [x, y, z] - the grasp position (already calculated by hand-eye system)
+        brick_position: [x, y, z] brick TOP SURFACE position from hand-eye camera
+                       Note: Z is already compensated by DynamicZCompensator
         brick_yaw: brick yaw angle in radians
-        tcp_position: [x, y, z] current TCP position (from pre-grasp)
-        tcp_orientation: [roll, pitch, yaw] current TCP orientation
-        brick_size: [L, W, H] brick dimensions (default: standard brick)
-        gripper_max_opening: maximum gripper opening width
-        gripper_clearance: extra clearance to add to brick width
+        tcp_position: [x, y, z] current TCP position (at hover)
+        brick_size: [L, W, H] brick dimensions
+        gripper_max_opening: maximum gripper opening (meters)
+        gripper_clearance: clearance between gripper and brick (meters)
+        z_compensation: Z compensation value applied by DynamicZCompensator (for context)
         
     Returns:
-        Context dictionary ready for get_descend_prompt()
+        Context dictionary for prompt builder
     """
+    # Default brick size
     if brick_size is None:
-        brick_size = [0.11, 0.05, 0.025]
+        brick_size = [0.11, 0.05, 0.025]  # L, W, H
     
+    # Default TCP position if not provided
     if tcp_position is None:
         tcp_position = [brick_position[0], brick_position[1], brick_position[2] + 0.15]
-    
-    if tcp_orientation is None:
-        tcp_orientation = [0.0, 0.0, brick_yaw]
     
     return {
         "robot": {
@@ -254,10 +254,9 @@ def build_descend_context(
         "gripper": {
             "max_opening": gripper_max_opening,
             "clearance": gripper_clearance,
-            "state": "open",
         },
         "brick": {
-            "position": brick_position,  # This is the GRASP position (already correct height)
+            "position": brick_position,
             "size_LWH": brick_size,
             "yaw": brick_yaw,
         },
@@ -265,11 +264,6 @@ def build_descend_context(
             "x": tcp_position[0],
             "y": tcp_position[1],
             "z": tcp_position[2],
-            "roll": tcp_orientation[0],
-            "pitch": tcp_orientation[1],
-            "yaw": tcp_orientation[2],
         },
-        "constraints": {
-            "safety_clearance": 0.005,
-        },
+        "z_compensation": z_compensation,
     }

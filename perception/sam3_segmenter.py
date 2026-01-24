@@ -126,16 +126,18 @@ class SAM3Segmenter:
         frame: np.ndarray, 
         mask: Optional[np.ndarray],
         color: tuple = (0, 255, 0),
-        thickness: int = 2
+        thickness: int = 2,
+        selected_index: Optional[int] = None,
     ) -> np.ndarray:
         """
         Draw detection bounding box on frame.
         
         Args:
             frame: BGR image to draw on
-            mask: segmentation mask from segment()
-            color: box color (BGR)
+            mask: segmentation mask(s) from segment() - can be single or multiple
+            color: box color (BGR) for selected/single detection
             thickness: line thickness
+            selected_index: if provided, highlight this mask specially (others drawn dimmer)
             
         Returns:
             Frame with detection visualization
@@ -144,36 +146,87 @@ class SAM3Segmenter:
             return frame
         
         result = frame.copy()
-        
-        # Handle mask dimensions
-        m = mask[0] if len(mask.shape) == 3 else mask
         h, w = result.shape[:2]
         
-        if m.shape != (h, w):
-            m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+        # Color palette for multiple detections
+        colors = [
+            (0, 255, 0),    # Green
+            (255, 0, 0),    # Blue
+            (0, 255, 255),  # Yellow
+            (255, 0, 255),  # Magenta
+            (0, 165, 255),  # Orange
+            (255, 255, 0),  # Cyan
+        ]
         
-        mask_bool = (m > 0.5).astype(np.uint8)
-        
-        # Find contours
-        contours, _ = cv2.findContours(mask_bool, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        # Handle single vs multiple masks
+        if len(mask.shape) == 2:
+            # Single 2D mask
+            masks_list = [mask]
+        elif len(mask.shape) == 3:
+            # Multiple masks: (N, H, W) or single (1, H, W)
+            if mask.shape[0] == 1:
+                masks_list = [mask[0]]
+            else:
+                masks_list = [mask[i] for i in range(mask.shape[0])]
+        elif len(mask.shape) == 4:
+            # Shape like (N, 1, H, W)
+            masks_list = [mask[i, 0] for i in range(mask.shape[0])]
+        else:
             return result
         
-        largest = max(contours, key=cv2.contourArea)
-        
-        # Draw oriented bounding box only
-        if len(largest) >= 5:
-            rect = cv2.minAreaRect(largest)
-            box = cv2.boxPoints(rect)
-            box = np.int0(box)
-            cv2.drawContours(result, [box], 0, color, thickness)
-        
-        # Draw center point
-        M = cv2.moments(largest)
-        if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            cv2.circle(result, (cx, cy), 5, (255, 0, 0), -1)
+        # Draw each mask
+        for i, m in enumerate(masks_list):
+            # Resize if needed
+            if m.shape != (h, w):
+                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+            
+            mask_bool = (m > 0.5).astype(np.uint8)
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask_bool, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            
+            largest = max(contours, key=cv2.contourArea)
+            
+            # Determine color and thickness for this mask
+            if selected_index is not None:
+                if i == selected_index:
+                    # Selected brick: bright color, thick line
+                    draw_color = (0, 255, 0)  # Bright green
+                    draw_thickness = 3
+                else:
+                    # Non-selected: dimmer color, thin line
+                    draw_color = (100, 100, 100)  # Gray
+                    draw_thickness = 1
+            else:
+                # No selection: show all with different colors
+                draw_color = colors[i % len(colors)]
+                draw_thickness = thickness
+            
+            # Draw oriented bounding box
+            if len(largest) >= 5:
+                rect = cv2.minAreaRect(largest)
+                box = cv2.boxPoints(rect)
+                box = np.int0(box)
+                cv2.drawContours(result, [box], 0, draw_color, draw_thickness)
+            
+            # Draw center point and index
+            M = cv2.moments(largest)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                
+                # Center point
+                if selected_index is None or i == selected_index:
+                    cv2.circle(result, (cx, cy), 5, draw_color, -1)
+                    # Draw index number
+                    cv2.putText(result, f"#{i}", (cx + 10, cy - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2)
+                else:
+                    cv2.circle(result, (cx, cy), 3, draw_color, -1)
+                    cv2.putText(result, f"#{i}", (cx + 10, cy - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, draw_color, 1)
         
         return result
 

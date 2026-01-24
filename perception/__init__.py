@@ -1,27 +1,29 @@
 """
-Perception Module
+Perception module for grasp planning.
 
-Provides perception capabilities for robot manipulation:
-- SAM3 segmentation
-- Position calculation from cameras
+Exports:
+- SAM3Segmenter: Semantic segmentation with SAM3
+- HeadCameraCalculator: Head camera position calculation with Z compensation
+- HandEyeCalculator: Hand-eye camera position calculation
+- DynamicZCompensator: Dynamic Z-axis compensation
 """
 
 from .sam3_segmenter import SAM3Segmenter, create_segmenter
 from .position_calculator import (
-    HeadCameraCalculator,
+    HeadCameraCalculator, 
     HandEyeCalculator,
-    create_head_calculator,
+    DynamicZCompensator,
+    create_head_calculator, 
     create_handeye_calculator,
     estimate_orientation,
 )
 
 __all__ = [
-    # SAM3
     'SAM3Segmenter',
     'create_segmenter',
-    # Position calculators
-    'HeadCameraCalculator',
+    'HeadCameraCalculator', 
     'HandEyeCalculator',
+    'DynamicZCompensator',
     'create_head_calculator',
     'create_handeye_calculator',
     'estimate_orientation',

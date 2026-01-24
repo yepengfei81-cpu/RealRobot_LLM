@@ -136,10 +136,11 @@ class MultiGraspController:
         self._frame_lock = threading.Lock()
         self._latest_rgb: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
-        self._latest_mask: Optional[np.ndarray] = None
+        self._latest_mask: Optional[np.ndarray] = None  # All masks from detection
         self._head_mask_time: float = 0 
         self._handeye_mask: Optional[np.ndarray] = None
         self._handeye_mask_time: float = 0 
+        self._selected_brick_index: Optional[int] = None  # LLM selected brick index
         
         # ===== Setup executor callbacks =====
         self.executor.set_callbacks(
@@ -213,10 +214,16 @@ class MultiGraspController:
         if key == 'head':
             self._latest_mask = mask
             self._head_mask_time = time.time()
+            # Reset selection when new detection happens
+            self._selected_brick_index = None
         elif key == 'handeye':
             self._handeye_mask = mask
             self._handeye_mask_time = time.time()
-    
+
+    def _set_selected_brick(self, index: int):
+        """Set the LLM-selected brick index for visualization."""
+        self._selected_brick_index = index
+
     def _get_result(self, key: str) -> Optional[Dict]:
         with self._state_lock:
             if key == 'head':
@@ -285,6 +292,11 @@ class MultiGraspController:
         if masks is None or len(masks) == 0:
             return False, [], "No bricks detected by SAM3"
         
+        # Save ALL masks for display (not just first one)
+        self._latest_mask = masks
+        self._head_mask_time = time.time()
+        self._selected_brick_index = None  # Reset selection
+
         # Calculate position for each detected brick
         all_bricks = []
         for i, mask in enumerate(masks):
@@ -304,15 +316,10 @@ class MultiGraspController:
                 
                 print(f"  Brick {i}: [{pos_list[0]:.4f}, {pos_list[1]:.4f}, {pos_list[2]:.4f}] m, yaw={np.degrees(yaw):.1f}°")
         
-        # Save first mask for display
-        if len(masks) > 0:
-            self._latest_mask = masks[0]
-            self._head_mask_time = time.time()
-        
         print(f"[Scene] SAM3 detected {len(all_bricks)} brick(s)")
         
         return True, all_bricks, None
-    
+        
     # ==================== Stack Height Calculation ====================
     
     def _calculate_target_z(self, placed_count: int, verbose: bool = True) -> float:
@@ -357,6 +364,7 @@ class MultiGraspController:
         self._placed_count = 0
         self._total_attempts = 0
         self._initial_brick_count = 0
+        self._selected_brick_index = None  # Reset selection
         
         print("\n" + "=" * 60)
         print("[Multi-Brick Stacking Task] Pure LLM-driven Mode")
@@ -492,10 +500,13 @@ class MultiGraspController:
                 self.robot_env.reset_position()
                 break
             
+            # ===== Set selected brick for visualization =====
+            self._selected_brick_index = target_brick_idx
+            
             target_brick = detected_bricks[target_brick_idx]
             print(f"\n[Step 4] LLM selected brick #{target_brick_idx}")
             print(f"  Position: [{target_brick['position'][0]:.4f}, {target_brick['position'][1]:.4f}, {target_brick['position'][2]:.4f}] m")
-            
+
             # ===== Step 5: Calculate target Z for stacking =====
             target_z = self._calculate_target_z(self._placed_count)
             
@@ -631,8 +642,10 @@ class MultiGraspController:
                 if current_time - last_print_time > 0.5:
                     last_print_time = current_time
                     tcp_pos = self.robot_env.get_tcp_position()
+                    arm_effort = self.robot_env.get_arm_total_effort()
                     if tcp_pos is not None and not is_running:
-                        print(f"\r[TCP] Z: {tcp_pos[2]:.4f} m", end="", flush=True)
+                        effort_str = f", Arm Effort: {arm_effort:.2f}A" if arm_effort is not None else ""
+                        print(f"\r[TCP] Z: {tcp_pos[2]:.4f} m{effort_str}", end="", flush=True)
                 
                 # Display status
                 if is_running:
@@ -649,9 +662,13 @@ class MultiGraspController:
                 disp = self._draw_info(disp, self._get_result('llm'), "LLM:", 110, (255, 0, 255))
                 disp = self._draw_stack_info(disp)
                 
-                # Draw detection box (head camera)
+                # Draw detection box (head camera) with selection highlighting
                 if self._latest_mask is not None and (time.time() - self._head_mask_time) < 3.0:
-                    disp = self.segmenter.draw_detection(disp, self._latest_mask)
+                    disp = self.segmenter.draw_detection(
+                        disp, 
+                        self._latest_mask,
+                        selected_index=self._selected_brick_index
+                    )
                 cv2.imshow("Head Camera", disp)
 
                 # HandEye camera display
