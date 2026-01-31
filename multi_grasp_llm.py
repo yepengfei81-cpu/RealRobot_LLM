@@ -44,10 +44,16 @@ CONFIG_DIR = Path("/home/ypf/qiuzhiarm_LLM/config")
 BRICK_HEIGHT = 0.025          # 2.5cm per brick
 SAFETY_MARGIN = 0.003         # 0.3cm safety margin
 STACK_INCREMENT = BRICK_HEIGHT + SAFETY_MARGIN  # 2.8cm per layer
-PROXIMITY_THRESHOLD = 0.08    # 8cm - bricks within this distance are "at target"
+PROXIMITY_THRESHOLD = 0.05    # 5cm - bricks within this distance are "at target"
 MAX_TOTAL_ATTEMPTS = 20       # Maximum total grasp attempts
 MAX_BRICKS = 10               # Maximum number of bricks to handle
 
+# Anomaly detection parameters
+NORMAL_BRICK_AREA_CM2 = 45.0  # Minimum area for visible (non-occluded) brick
+
+# Brick size and ground height
+BRICK_SIZE_LWH = [0.11, 0.05, 0.025]  # L=110mm, W=50mm, H=25mm
+GROUND_Z = 0.86                        # Ground Z height estimate
 
 # ==================== Multi-Brick Grasp Controller ====================
 class MultiGraspController:
@@ -177,7 +183,7 @@ class MultiGraspController:
     
     def _print_help(self):
         print("=" * 60)
-        print("Multi-Brick Stacking Controller (Pure LLM-driven)")
+        print("Multi-Brick Stacking Controller (with Anomaly Detection)")
         print("=" * 60)
         print("  Space - Start multi-brick stacking task")
         print("  r     - Abort / Reset")
@@ -186,6 +192,7 @@ class MultiGraspController:
         print(f"  Brick height: {BRICK_HEIGHT*100:.1f} cm")
         print(f"  Safety margin: {SAFETY_MARGIN*100:.1f} cm")
         print(f"  Stack increment: {STACK_INCREMENT*100:.1f} cm per layer")
+        print(f"  Anomaly detection: area < {NORMAL_BRICK_AREA_CM2} cm² = occluded")
         print("=" * 60)
     
     # ==================== State Management ====================
@@ -269,9 +276,11 @@ class MultiGraspController:
         """
         Detect all bricks in the scene using head camera + SAM3.
         
+        Now uses HeadCameraCalculator which returns area_cm2 directly.
+        
         Returns:
             Tuple of (success, list_of_bricks, error_message)
-            Each brick dict contains: position, yaw, mask_index
+            Each brick dict contains: position, yaw, mask_index, area_cm2, area_pixels, z_height, relative_height
         """
         print("\n[Scene] Detecting all bricks with SAM3...")
         
@@ -297,26 +306,62 @@ class MultiGraspController:
         self._head_mask_time = time.time()
         self._selected_brick_index = None  # Reset selection
 
-        # Calculate position for each detected brick
+        # Calculate position and area for each detected brick
         all_bricks = []
+        h, w = depth.shape
+        
         for i, mask in enumerate(masks):
+            # 处理 mask 维度 - 与 test_brick_anomaly 保持一致
+            if len(mask.shape) == 3:
+                mask = mask[0]
+            if mask.shape != (h, w):
+                mask = cv2.resize(mask.astype(np.float32), (w, h), 
+                                 interpolation=cv2.INTER_NEAREST)
+            
             result = self.head_calc.compute(mask, depth, tf_matrix)
             if result is not None:
                 pos = result['position']
                 yaw = result['yaw']
+                area_cm2 = result['area_cm2']
+                area_pixels = result['area_pixels']
+                z_height = pos[2]  # Z in base_link frame
+                
+                # 计算 relative_height - 关键！
+                relative_height = z_height - GROUND_Z
                 
                 # Convert to list if numpy array
                 pos_list = pos.tolist() if hasattr(pos, 'tolist') else list(pos)
+                
+                # Determine visibility status based on area
+                if area_cm2 >= NORMAL_BRICK_AREA_CM2:
+                    visibility = "VISIBLE"
+                else:
+                    visibility = "OCCLUDED"
                 
                 all_bricks.append({
                     'position': pos_list,
                     'yaw': float(yaw),
                     'mask_index': i,
+                    'area_cm2': area_cm2,
+                    'area_pixels': area_pixels,
+                    'z_height': z_height,
+                    'relative_height': relative_height,  # 添加 relative_height
+                    'depth_median_m': result.get('depth_median_m', 0),
                 })
                 
-                print(f"  Brick {i}: [{pos_list[0]:.4f}, {pos_list[1]:.4f}, {pos_list[2]:.4f}] m, yaw={np.degrees(yaw):.1f}°")
+                print(f"  Brick {i}: [{pos_list[0]:.4f}, {pos_list[1]:.4f}, {pos_list[2]:.4f}] m, "
+                      f"yaw={np.degrees(yaw):.1f}°, area={area_cm2:.1f}cm², "
+                      f"rel_h={relative_height:.4f}m [{visibility}]")
         
-        print(f"[Scene] SAM3 detected {len(all_bricks)} brick(s)")
+        # Print summary
+        visible_count = sum(1 for b in all_bricks if b['area_cm2'] >= NORMAL_BRICK_AREA_CM2)
+        occluded_count = len(all_bricks) - visible_count
+        
+        print(f"[Scene] SAM3 detected {len(all_bricks)} brick(s): "
+              f"{visible_count} visible, {occluded_count} occluded")
+        
+        if occluded_count > 0:
+            print(f"[Scene] ⚠️ Anomaly detected: {occluded_count} brick(s) may be stacked on!")
         
         return True, all_bricks, None
         
@@ -445,6 +490,8 @@ class MultiGraspController:
             print(f"  Input: {len(detected_bricks)} brick(s) detected")
             print(f"  Target position: {self.target_position[:2]}")
             print(f"  Proximity threshold: {PROXIMITY_THRESHOLD} m")
+            print(f"  Ground Z: {GROUND_Z} m")
+            print(f"  Brick size LWH: {BRICK_SIZE_LWH}")
             
             success, scene_result, error = self.llm_planner.analyze_scene(
                 detected_bricks=detected_bricks,
@@ -452,6 +499,9 @@ class MultiGraspController:
                 placed_count=self._placed_count,
                 initial_brick_count=self._initial_brick_count,
                 proximity_threshold=PROXIMITY_THRESHOLD,
+                normal_brick_area_cm2=NORMAL_BRICK_AREA_CM2,
+                ground_z=GROUND_Z,
+                brick_size_LWH=BRICK_SIZE_LWH,
             )
             
             if not success:
@@ -465,11 +515,13 @@ class MultiGraspController:
             
             # ===== Step 4: Process LLM Decision =====
             task_complete = scene_result['task_complete']
+            anomaly_detected = scene_result.get('anomaly_detected', False)
             next_action = scene_result['next_action']
             action_type = next_action['type']
             
             print(f"\n[LLM Decision]")
             print(f"  Task complete: {task_complete}")
+            print(f"  Anomaly detected: {anomaly_detected}")
             print(f"  Action type: {action_type}")
             print(f"  Reason: {next_action.get('reason', 'N/A')}")
             
@@ -484,12 +536,17 @@ class MultiGraspController:
                 self._set_step(f"[Complete] Stacked {self._placed_count} bricks!")
                 break
             
-            # Check for error
+            # Check for error or rescan
             if action_type == 'error':
                 print(f"[Error] LLM reported error: {next_action['reason']}")
                 self._set_step(f"[Failed] LLM error: {next_action['reason']}")
                 self.robot_env.reset_position()
                 break
+            
+            if action_type == 'rescan':
+                print(f"[Rescan] LLM requested rescan: {next_action['reason']}")
+                self._set_step(f"[Rescan] {next_action['reason']}")
+                continue  # Go back to detection
             
             # Get target brick index
             target_brick_idx = next_action['target_brick_index']
@@ -506,15 +563,9 @@ class MultiGraspController:
             target_brick = detected_bricks[target_brick_idx]
             print(f"\n[Step 4] LLM selected brick #{target_brick_idx}")
             print(f"  Position: [{target_brick['position'][0]:.4f}, {target_brick['position'][1]:.4f}, {target_brick['position'][2]:.4f}] m")
+            print(f"  Area: {target_brick.get('area_cm2', 0):.1f} cm²")
 
-            # ===== Step 5: Calculate target Z for stacking =====
-            target_z = self._calculate_target_z(self._placed_count)
-            
-            # ===== Step 6: Execute grasp-place cycle =====
-            self._set_step(f"[Cycle {self._total_attempts}] Executing grasp-place...")
-            print(f"\n[Step 6] Executing grasp-place cycle")
-            print(f"  Target brick: #{target_brick_idx}")
-            print(f"  Target stack Z: {target_z:.4f} m")
+            # ===== Step 5: Determine execution parameters based on action type =====
             
             # Get fresh frame for executor
             rgb, depth = self._get_latest_frame()
@@ -523,23 +574,74 @@ class MultiGraspController:
                 self._set_step("[Failed] Camera frame unavailable")
                 break
             
-            # Execute grasp-place with custom target Z
-            success, error = self.executor.execute_single_grasp_place(
-                rgb=rgb,
-                depth=depth,
-                target_surface_z=target_z,
-                brick_index=target_brick_idx,
-            )
+            if action_type == 'remove_anomaly':
+                # ===== ANOMALY REMOVAL MODE =====
+                # place_position should already be set by LLM or llm_grasp_planner fallback
+                place_position = next_action.get('place_position')
+                
+                if place_position is None:
+                    print(f"[Error] place_position is None - this should not happen!")
+                    self._set_step(f"[Failed] Invalid place_position")
+                    continue
+                
+                print(f"\n[Step 5] ANOMALY REMOVAL mode")
+                print(f"  Target brick: #{target_brick_idx} (stacked on another)")
+                print(f"  Current position: [{target_brick['position'][0]:.4f}, {target_brick['position'][1]:.4f}, {target_brick['position'][2]:.4f}]")
+                print(f"  Place position (from LLM): [{place_position[0]:.4f}, {place_position[1]:.4f}, {place_position[2]:.4f}]")
+                y_offset = place_position[1] - target_brick['position'][1]
+                print(f"  (Y offset: {y_offset:+.2f}m from current position)")
+                
+                self._set_step(f"[Cycle {self._total_attempts}] Removing anomaly brick #{target_brick_idx}...")
+                
+                # Execute grasp-place with custom place position
+                success, error = self.executor.execute_single_grasp_place(
+                    rgb=rgb,
+                    depth=depth,
+                    target_surface_z=place_position[2],  # Use the Z from place_position
+                    brick_index=target_brick_idx,
+                    custom_place_position=place_position,
+                    is_anomaly_removal=True,
+                )
+                
+                if success:
+                    print(f"\n[Success] Anomaly brick #{target_brick_idx} removed!")
+                    self._set_step(f"[Success] Anomaly removed")
+                else:
+                    print(f"\n[Failed] Anomaly removal failed: {error}")
+                    self._set_step(f"[Failed] {error}")
+                    # Don't break - let LLM decide next action in next cycle
+                    
+            elif action_type == 'grasp':
+                # ===== NORMAL STACKING MODE =====
+                target_z = self._calculate_target_z(self._placed_count)
+                
+                print(f"\n[Step 5] NORMAL STACKING mode")
+                print(f"  Target brick: #{target_brick_idx}")
+                print(f"  Target stack Z: {target_z:.4f} m")
+                
+                self._set_step(f"[Cycle {self._total_attempts}] Stacking brick #{target_brick_idx}...")
+                
+                # Execute grasp-place with target stack position
+                success, error = self.executor.execute_single_grasp_place(
+                    rgb=rgb,
+                    depth=depth,
+                    target_surface_z=target_z,
+                    brick_index=target_brick_idx,
+                )
+                
+                if success:
+                    self._placed_count += 1
+                    print(f"\n[Success] Brick #{target_brick_idx} placed!")
+                    print(f"  Total placed: {self._placed_count}/{self._initial_brick_count}")
+                    self._set_step(f"[Success] Placed {self._placed_count}/{self._initial_brick_count}")
+                else:
+                    print(f"\n[Failed] Grasp-place failed: {error}")
+                    self._set_step(f"[Failed] {error}")
+                    # Don't break - let LLM decide next action in next cycle
             
-            if success:
-                self._placed_count += 1
-                print(f"\n[Success] Brick #{target_brick_idx} placed!")
-                print(f"  Total placed: {self._placed_count}/{self._initial_brick_count}")
-                self._set_step(f"[Success] Placed {self._placed_count}/{self._initial_brick_count}")
             else:
-                print(f"\n[Failed] Grasp-place failed: {error}")
-                self._set_step(f"[Failed] {error}")
-                # Don't break - let LLM decide next action in next cycle
+                print(f"[Warning] Unknown action type: {action_type}")
+                self._set_step(f"[Warning] Unknown action: {action_type}")
         
         # ===== Final cleanup =====
         print("\n[Final] Returning to initial position...")

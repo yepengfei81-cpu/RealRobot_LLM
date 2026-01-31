@@ -1,11 +1,15 @@
 """
-Scene Analysis Prompt for Multi-Brick Stacking
+Scene Analysis Prompt for Multi-Brick Stacking (v4)
 
-This prompt enables LLM to analyze the current scene state:
-- Count detected bricks
-- Identify which bricks are at target location (already stacked)
-- Determine if task is complete
-- Select next brick to grasp
+Detection Logic:
+1. rel_h < 0.032m (normal flat height range):
+   - area >= 45cm² → FLAT (normal)
+   - area < 45cm² → OCCLUDED (being stacked on)
+
+2. rel_h >= 0.032m (abnormal height):
+   - area >= 45cm² → STACKED_UPPER (on top of another brick)
+   - area 25-45cm² → SIDE (侧放)
+   - area < 25cm² → UPRIGHT (竖放)
 """
 
 import math
@@ -14,222 +18,296 @@ from typing import Dict, Any, Optional, Tuple, List
 from .base_prompt import BasePromptBuilder
 
 
+# ==================== Constants ====================
+
+DEFAULT_BRICK_SIZE_LWH = [0.11, 0.05, 0.025]  # L=110mm, W=50mm, H=25mm
+NORMAL_BRICK_AREA_CM2 = 45.0  # 正常平放砖块面积阈值
+SIDE_AREA_THRESHOLD = 30.0    # 侧放砖块面积阈值 (L*H ≈ 27.5cm²)
+HEIGHT_THRESHOLD = 0.032      # 高度阈值 (略高于正常平放 H/2=0.0125m)
+ANOMALY_PLACE_OFFSET_Y = 0.10  # 默认 Y 偏移
+BRICK_SAFE_DISTANCE = 0.10    # 砖块之间的安全距离 (略大于砖块对角线)
+
+
 # ==================== Reply Template ====================
 
-SCENE_ANALYSIS_REPLY_TEMPLATE = """
-{
-  "task_complete": <boolean>,
-  "confidence": <float 0.0-1.0>,
+SCENE_ANALYSIS_REPLY_TEMPLATE = """{
+  "task_complete": <bool>,
+  "confidence": <float 0-1>,
+  "anomaly_detected": <bool>,
   "scene_state": {
     "total_bricks_detected": <int>,
-    "bricks_at_target": <int, bricks within proximity_threshold of target>,
-    "bricks_to_grasp": <int, remaining bricks away from target>,
-    "estimated_stack_height": <int, number of bricks stacked>
+    "bricks_at_target": <int>,
+    "bricks_to_grasp": <int>,
+    "stacked_anomaly_count": <int>,
+    "pose_anomaly_count": <int>,
+    "occluded_count": <int>
   },
   "next_action": {
-    "type": "<string: 'grasp' | 'complete' | 'error'>",
-    "target_brick_index": <int or null, ORIGINAL index in detected_bricks list>,
-    "reason": "<string explaining the decision>"
+    "type": "<'remove_anomaly'|'grasp'|'complete'|'error'>",
+    "target_brick_index": <int or null>,
+    "place_position": <[x,y,z] or null>,
+    "reason": "<string>"
   },
+  "bricks_status": [
+    {"index": <int>, "pose": "<flat|side|upright|stacked_upper|stacked_lower>", "status": "<normal|anomaly_stacking|anomaly_pose|occluded|at_target>", "graspable": <bool>, "reasoning": "<brief>"}
+  ],
   "analysis": {
-    "target_area_status": "<string: 'empty' | 'has_stack' | 'complete'>",
-    "completion_criteria_met": <boolean>,
-    "reasoning": "<string, max 80 words>"
+    "stacking_pairs": "<list of [upper_idx, lower_idx] pairs or []>",
+    "place_position_reasoning": "<explain why this position is safe>",
+    "reasoning": "<string>"
   }
-}
-""".strip()
+}"""
 
 
-# ==================== Scene Analysis Prompt Builder ====================
+# ==================== Prompt Builder ====================
 
 class SceneAnalysisPromptBuilder(BasePromptBuilder):
-    """
-    Prompt builder for multi-brick scene analysis.
-    
-    Goal: Analyze detected bricks to determine task state and next action.
-    """
+    """Scene analysis with height-first, area-second detection logic."""
     
     def _get_current_phase_name(self) -> str:
-        return "Scene Analysis for Multi-Brick Stacking"
+        return "Scene Analysis"
     
     def _get_completed_steps(self) -> List[str]:
         placed = self.context.get('task_state', {}).get('placed_count', 0)
-        if placed == 0:
-            return ["Task initialized"]
-        return [f"Placed {placed} brick(s) at target location"]
+        return [f"Placed {placed} brick(s)"] if placed > 0 else ["Task started"]
     
     def _get_pending_steps(self) -> List[str]:
-        return [
-            "Analyze current scene (current task)",
-            "Determine if task is complete",
-            "If not complete: select next brick to grasp",
-            "Execute grasp-place cycle",
-        ]
+        return ["Classify bricks", "Detect stacking pairs", "Find safe place position", "Decide action"]
     
     def _get_role_name(self) -> str:
-        return "Multi-Brick Stacking Scene Analyzer"
+        return "Brick Scene Analyzer"
     
     def _get_main_responsibilities(self) -> List[str]:
         return [
-            "Count and locate all detected bricks",
-            "Identify bricks already at target location (stacked)",
-            "Determine if stacking task is complete",
-            "Select the next brick to grasp (if task not complete)",
-            "Ensure safe and efficient brick selection",
+            "Classify each brick by rel_h first, then area",
+            "Detect stacking pairs (upper + lower)",
+            "Calculate safe place_position avoiding other bricks",
+            "Select next action based on anomaly priority",
         ]
     
     def _get_specific_task(self) -> str:
         bricks = self.context.get('detected_bricks', [])
         target = self.context.get('target_position', {})
         target_xy = [target.get('x', 0.54), target.get('y', -0.04)]
-        proximity_threshold = self.context.get('proximity_threshold', 0.08)
+        proximity = self.context.get('proximity_threshold', 0.08)
+        ground_z = self.context.get('ground_z', 0.86)
+        brick_size = self.context.get('brick_size_LWH', DEFAULT_BRICK_SIZE_LWH)
+        L, W, H = brick_size
         
-        task_state = self.context.get('task_state', {})
-        placed_count = task_state.get('placed_count', 0)
-        initial_count = task_state.get('initial_brick_count', len(bricks))
+        # 理论面积计算
+        flat_area = L * W * 10000   # 平放: 11*5 = 55 cm²
+        side_area = L * H * 10000   # 侧放: 11*2.5 = 27.5 cm²
+        upright_area = W * H * 10000  # 竖放: 5*2.5 = 12.5 cm²
         
-        # Format brick list with clear at_target marking
-        brick_info = ""
-        for brick in bricks:
-            idx = brick.get('original_index', 0)
-            pos = brick.get('position', [0, 0, 0])
-            dist = brick.get('distance_to_target', 0)
-            at_target = dist < proximity_threshold
-            status = "⚠️ AT TARGET - DO NOT GRASP" if at_target else "✓ Available to grasp"
-            brick_info += f"  - Brick {idx}: position=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m, "
-            brick_info += f"distance_to_target={dist:.3f} m → {status}\n"
+        # Build brick table
+        brick_rows = []
+        for b in bricks:
+            idx = b.get('original_index', 0)
+            pos = b.get('position', [0, 0, 0])
+            rel_h = b.get('relative_height', pos[2] - ground_z)
+            area = b.get('area_cm2', 0)
+            dist = b.get('distance_to_target', 0)
+            at_tgt = "Y" if dist < proximity else "N"
+            
+            brick_rows.append(f"#{idx}: rel_h={rel_h:.4f}m area={area:.1f}cm² pos=[{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}] dist={dist:.3f}m at_tgt={at_tgt}")
         
-        if not brick_info:
-            brick_info = "  (No bricks detected)\n"
+        brick_table = "\n".join(brick_rows) if brick_rows else "(none)"
         
-        return f"""
-Analyze the current scene and determine the next action for brick stacking.
+        return f"""Analyze each brick and decide next action.
 
-**Target Placement Location:**
-- XY Position: [{target_xy[0]:.3f}, {target_xy[1]:.3f}] m
-- Proximity threshold: {proximity_threshold:.3f} m (bricks within this distance are considered "at target")
+**Brick dimensions:** L={L*100:.1f}cm, W={W*100:.1f}cm, H={H*100:.1f}cm
+**Ground Z:** {ground_z:.3f}m | **Target XY:** [{target_xy[0]:.3f}, {target_xy[1]:.3f}]
+**Height threshold:** {HEIGHT_THRESHOLD}m (normal flat brick rel_h ≈ 0.012-0.025m)
+**Safe distance between bricks:** {BRICK_SAFE_DISTANCE}m
 
-**Task Progress:**
-- Bricks placed so far: {placed_count}
-- Initial brick count: {initial_count}
-- Expected remaining: {initial_count - placed_count}
+**Theoretical areas:**
+- FLAT (top view): {flat_area:.1f}cm²
+- SIDE (side view): {side_area:.1f}cm²  
+- UPRIGHT (end view): {upright_area:.1f}cm²
 
-**Detected Bricks (with ORIGINAL indices):**
-{brick_info}
+=== CLASSIFICATION LOGIC ===
 
-**CRITICAL RULES:**
-1. Count how many bricks are near the target (distance < {proximity_threshold:.3f} m) - these are ALREADY STACKED
-2. NEVER select a brick that is "AT TARGET" - it's already placed!
-3. Task is complete if: no bricks available to grasp (all at target)
-4. If not complete: select a brick with distance_to_target >= {proximity_threshold:.3f} m
-5. Return the ORIGINAL brick index (the number shown after "Brick")
+**Step 1: Check rel_h (relative height from ground)**
 
-**Your Task:**
-- If all bricks are at target → return type="complete"
-- If bricks remain to grasp → return type="grasp" with the ORIGINAL index of a brick NOT at target
-""".strip()
+IF rel_h < {HEIGHT_THRESHOLD}m → Normal height range (flat on ground)
+  - area >= {NORMAL_BRICK_AREA_CM2:.0f}cm² → FLAT, status=normal, graspable=true
+  - area < {NORMAL_BRICK_AREA_CM2:.0f}cm² → OCCLUDED (stacked_lower), status=occluded, graspable=false
+
+IF rel_h >= {HEIGHT_THRESHOLD}m → Abnormal height (elevated or tilted)
+  - area >= {NORMAL_BRICK_AREA_CM2:.0f}cm² → STACKED_UPPER, status=anomaly_stacking, graspable=true
+  - area {SIDE_AREA_THRESHOLD:.0f}-{NORMAL_BRICK_AREA_CM2:.0f}cm² → SIDE, status=anomaly_pose, graspable=false
+  - area < {SIDE_AREA_THRESHOLD:.0f}cm² → UPRIGHT, status=anomaly_pose, graspable=false
+
+**Step 2: Detect stacking pairs**
+
+For each STACKED_UPPER brick, find its paired OCCLUDED brick:
+- Look for an OCCLUDED brick with similar XY position (distance < 0.10m)
+- Record as stacking_pair: [upper_idx, lower_idx]
+
+**Step 3: Check at_target status**
+
+If FLAT brick is at target (dist < {proximity}m):
+- Change status to "at_target", graspable=false
+
+**Step 4: Calculate safe place_position for remove_anomaly**
+
+When removing a stacked_upper brick, you need to place it at a SAFE position:
+
+1. **Baseline:** Start with [upper.x, upper.y + {ANOMALY_PLACE_OFFSET_Y}, {ground_z + H}]
+   (Move +{ANOMALY_PLACE_OFFSET_Y*100:.0f}cm in Y direction)
+
+2. **Check for collisions:** 
+   For each other brick (excluding the stacked_lower being freed):
+   - Calculate XY distance from candidate position to that brick
+   - If distance < {BRICK_SAFE_DISTANCE}m, position is NOT safe
+
+3. **If baseline is not safe, adjust:**
+   - Try [upper.x, upper.y + 0.15, z] (move further in Y)
+   - Try [upper.x + 0.10, upper.y + 0.10, z] (add X offset)
+   - Try [upper.x - 0.10, upper.y + 0.10, z] (negative X offset)
+   - Choose the first position that is safe
+
+4. **Place Z height:** Always use ground_z + H/2 = {ground_z + H:.3f}m
+
+=== ACTION PRIORITY ===
+
+1. If stacking_pairs exist → type="remove_anomaly"
+   - target = stacked_upper brick index
+   - place_position = [calculated safe position]
+   - Explain in place_position_reasoning why this position is chosen
+   
+2. If only pose anomalies (SIDE/UPRIGHT) and no graspable FLAT → type="error"
+
+3. If all graspable bricks are at_target → type="complete"
+
+4. Otherwise → type="grasp"
+   - target = first graspable FLAT brick not at target
+
+**Detected Bricks:**
+{brick_table}"""
     
     def _get_phase_specific_knowledge(self) -> str:
-        proximity_threshold = self.context.get('proximity_threshold', 0.08)
-        brick_height = self.context.get('brick_height', 0.025)
-        stack_increment = self.context.get('stack_increment', 0.028)
+        brick_size = self.context.get('brick_size_LWH', DEFAULT_BRICK_SIZE_LWH)
+        L, W, H = brick_size
+        ground_z = self.context.get('ground_z', 0.86)
         
-        return f"""
-**Multi-Brick Stacking Logic:**
+        return f"""**Quick Reference Table:**
 
-```
-Scene Analysis Decision Tree:
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. Count bricks at target (distance < {proximity_threshold:.3f} m) - STACKED     │
-│ 2. Count bricks away from target (distance >= {proximity_threshold:.3f} m) - TO GRASP │
-├─────────────────────────────────────────────────────────────────┤
-│ IF no bricks to grasp (all at target) → COMPLETE                │
-│ IF bricks to grasp > 0 → SELECT one that is NOT at target       │
-│ IF no bricks detected → ERROR                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+| rel_h | area | pose | status | graspable |
+|-------|------|------|--------|-----------|
+| <{HEIGHT_THRESHOLD}m | ≥{NORMAL_BRICK_AREA_CM2:.0f}cm² | flat | normal/at_target | true/false |
+| <{HEIGHT_THRESHOLD}m | <{NORMAL_BRICK_AREA_CM2:.0f}cm² | stacked_lower | occluded | false |
+| ≥{HEIGHT_THRESHOLD}m | ≥{NORMAL_BRICK_AREA_CM2:.0f}cm² | stacked_upper | anomaly_stacking | true |
+| ≥{HEIGHT_THRESHOLD}m | {SIDE_AREA_THRESHOLD:.0f}-{NORMAL_BRICK_AREA_CM2:.0f}cm² | side | anomaly_pose | false |
+| ≥{HEIGHT_THRESHOLD}m | <{SIDE_AREA_THRESHOLD:.0f}cm² | upright | anomaly_pose | false |
 
-**⚠️ CRITICAL: Brick Selection Rules:**
-- A brick with distance < {proximity_threshold:.3f} m is AT TARGET (already stacked)
-- NEVER select a brick that is at target - you'd be picking up your own stack!
-- Only select bricks with distance >= {proximity_threshold:.3f} m
+**Safe Place Position Calculation:**
 
-**Brick Selection Strategy (for bricks NOT at target):**
-- Prefer bricks farther from target (less risk of disturbing stack)
-- Any brick NOT at target is valid to grasp
+Given stacked_upper at position [x, y, z], check these candidate positions in order:
 
-**Stacking Height Calculation:**
-- Each brick height: {brick_height:.3f} m
-- Stack increment (with margin): {stack_increment:.3f} m
-- Stack of N bricks ≈ N × {stack_increment:.3f} m above surface
+| Priority | Candidate Position | Description |
+|----------|-------------------|-------------|
+| 1 | [x, y+0.10, {ground_z + H:.3f}] | Baseline: +10cm Y |
+| 2 | [x, y+0.15, {ground_z + H:.3f}] | Extended: +15cm Y |
+| 3 | [x+0.10, y+0.10, {ground_z + H:.3f}] | Diagonal: +10cm X, +10cm Y |
+| 4 | [x-0.10, y+0.10, {ground_z + H:.3f}] | Diagonal: -10cm X, +10cm Y |
 
-**Completion Criteria:**
-- All bricks consolidated at target location
-- No isolated bricks remaining elsewhere (no bricks with distance >= {proximity_threshold:.3f} m)
-""".strip()
+For each candidate, verify:
+- Distance to ALL other bricks >= {BRICK_SAFE_DISTANCE}m
+- Choose the first safe position
+
+**Distance formula:** sqrt((x1-x2)² + (y1-y2)²)
+
+**Example:**
+If brick at [0.52, -0.01, z] is stacked_upper, and there's another brick at [0.52, 0.08, z]:
+- Baseline [0.52, 0.09, z]: distance to [0.52, 0.08] = 0.01m < 0.12m → NOT SAFE
+- Extended [0.52, 0.14, z]: distance = 0.06m < 0.12m → NOT SAFE  
+- Diagonal [0.62, 0.09, z]: distance = sqrt(0.10² + 0.01²) = 0.10m < 0.12m → NOT SAFE
+- Diagonal [0.42, 0.09, z]: distance = sqrt(0.10² + 0.01²) = 0.10m < 0.12m → NOT SAFE
+- Try [0.52, 0.20, z]: distance = 0.12m = 0.12m → SAFE (barely)"""
     
     def _get_thinking_steps(self) -> List[Dict[str, str]]:
         bricks = self.context.get('detected_bricks', [])
-        proximity_threshold = self.context.get('proximity_threshold', 0.08)
+        ground_z = self.context.get('ground_z', 0.86)
+        brick_size = self.context.get('brick_size_LWH', DEFAULT_BRICK_SIZE_LWH)
+        H = brick_size[2]
         
-        # Pre-calculate for thinking steps
-        at_target_bricks = [b for b in bricks if b.get('distance_to_target', 999) < proximity_threshold]
-        graspable_bricks = [b for b in bricks if b.get('distance_to_target', 999) >= proximity_threshold]
+        # Pre-classify for hint
+        flat_normal = []
+        occluded = []
+        stacked_upper = []
+        side = []
+        upright = []
         
-        at_target_indices = [b.get('original_index', '?') for b in at_target_bricks]
-        graspable_indices = [b.get('original_index', '?') for b in graspable_bricks]
+        stacked_upper_pos = None  # 记录 stacked_upper 的位置
         
-        return [
-            {
-                "title": "Step 1: Classify Bricks",
-                "content": f"""
-- Total detected: {len(bricks)}
-- At target (distance < {proximity_threshold:.3f} m): {len(at_target_bricks)} → indices: {at_target_indices}
-- Available to grasp (distance >= {proximity_threshold:.3f} m): {len(graspable_bricks)} → indices: {graspable_indices}
-""".strip()
-            },
-            {
-                "title": "Step 2: Check Completion",
-                "content": f"""
-- Bricks available to grasp: {len(graspable_bricks)}
-- Task complete? → {"YES (all at target)" if len(graspable_bricks) == 0 else "NO (bricks remain)"}
-""".strip()
-            },
-            {
-                "title": "Step 3: Select Next Brick (if not complete)",
-                "content": f"""
-- If not complete, select from graspable bricks: {graspable_indices}
-- Choose the one farthest from target (safest)
-- Return its ORIGINAL index
-- ⚠️ DO NOT return indices: {at_target_indices} (these are at target!)
-""".strip()
-            },
-        ]
+        for b in bricks:
+            idx = b.get('original_index', 0)
+            area = b.get('area_cm2', 0)
+            rel_h = b.get('relative_height', 0)
+            pos = b.get('position', [0, 0, 0])
+            
+            if rel_h < HEIGHT_THRESHOLD:
+                if area >= NORMAL_BRICK_AREA_CM2:
+                    flat_normal.append(f"#{idx}[{pos[0]:.2f},{pos[1]:.2f}]")
+                else:
+                    occluded.append(f"#{idx}(area={area:.0f})")
+            else:
+                if area >= NORMAL_BRICK_AREA_CM2:
+                    stacked_upper.append(f"#{idx}(rel_h={rel_h:.3f})")
+                    stacked_upper_pos = pos
+                elif area >= SIDE_AREA_THRESHOLD:
+                    side.append(f"#{idx}(area={area:.0f},rel_h={rel_h:.3f})")
+                else:
+                    upright.append(f"#{idx}(area={area:.0f},rel_h={rel_h:.3f})")
+        
+        # Check for stacking pairs and suggest safe position
+        stacking_hint = ""
+        position_hint = ""
+        if occluded and stacked_upper and stacked_upper_pos:
+            stacking_hint = f"\n⚠️ Likely stacking: {len(stacked_upper)} upper + {len(occluded)} lower"
+            
+            # Calculate baseline position
+            baseline_pos = [stacked_upper_pos[0], stacked_upper_pos[1] + ANOMALY_PLACE_OFFSET_Y, ground_z + H]
+            
+            # Check distances to all other bricks
+            all_positions = [(b['original_index'], b['position']) for b in bricks]
+            conflicts = []
+            for idx, pos in all_positions:
+                dist = math.sqrt((baseline_pos[0] - pos[0])**2 + (baseline_pos[1] - pos[1])**2)
+                if dist < BRICK_SAFE_DISTANCE:
+                    conflicts.append(f"#{idx}(dist={dist:.2f}m)")
+            
+            if conflicts:
+                position_hint = f"\n⚠️ Baseline position may conflict with: {', '.join(conflicts)}"
+                position_hint += f"\n   Consider adjusting place_position!"
+            else:
+                position_hint = f"\n✓ Baseline position [{baseline_pos[0]:.2f}, {baseline_pos[1]:.2f}, {baseline_pos[2]:.3f}] appears safe"
+        
+        analysis = f"""Pre-classification (verify with your analysis):
+- FLAT normal: {', '.join(flat_normal) or 'none'}
+- OCCLUDED (stacked_lower): {', '.join(occluded) or 'none'}  
+- STACKED_UPPER: {', '.join(stacked_upper) or 'none'}
+- SIDE: {', '.join(side) or 'none'}
+- UPRIGHT: {', '.join(upright) or 'none'}{stacking_hint}{position_hint}"""
+        
+        return [{"title": "Initial classification", "content": analysis}]
     
     def _get_output_template(self) -> str:
         return SCENE_ANALYSIS_REPLY_TEMPLATE
     
     def _get_output_constraints(self) -> List[str]:
-        proximity_threshold = self.context.get('proximity_threshold', 0.08)
-        bricks = self.context.get('detected_bricks', [])
-        
-        at_target_indices = [b.get('original_index', '?') for b in bricks 
-                           if b.get('distance_to_target', 999) < proximity_threshold]
-        graspable_indices = [b.get('original_index', '?') for b in bricks 
-                            if b.get('distance_to_target', 999) >= proximity_threshold]
-        
-        constraints = [
-            "task_complete: true only if NO bricks available to grasp",
-            f"bricks_at_target: count of bricks with distance < {proximity_threshold:.3f} m",
-            "next_action.type: 'grasp' if bricks remain, 'complete' if done, 'error' if problem",
-            f"target_brick_index: MUST be one of {graspable_indices} if type='grasp'",
-            f"⚠️ FORBIDDEN indices (at target): {at_target_indices} - NEVER select these!",
-            "Output JSON only, no markdown code blocks",
+        return [
+            f"Use rel_h threshold {HEIGHT_THRESHOLD}m to split normal vs abnormal height",
+            "Then use area to distinguish specific pose",
+            "For stacking: record [upper_idx, lower_idx] in stacking_pairs",
+            f"place_position MUST be safe: distance to all bricks >= {BRICK_SAFE_DISTANCE}m",
+            "Explain your place_position choice in place_position_reasoning",
+            "Output JSON only, no markdown"
         ]
-        return constraints
 
 
-# ==================== Main Function ====================
+# ==================== Main Functions ====================
 
 def get_scene_analysis_prompt(context: Dict[str, Any], 
                               attempt_idx: int = 0, 
@@ -239,8 +317,6 @@ def get_scene_analysis_prompt(context: Dict[str, Any],
     return builder.build()
 
 
-# ==================== Context Builder Helper ====================
-
 def build_scene_analysis_context(
     detected_bricks: List[Dict[str, Any]],
     target_position: List[float],
@@ -249,44 +325,48 @@ def build_scene_analysis_context(
     proximity_threshold: float = 0.08,
     brick_height: float = 0.025,
     stack_increment: float = 0.028,
+    normal_brick_area_cm2: float = NORMAL_BRICK_AREA_CM2,
+    ground_z: float = 0.86,
+    brick_size_LWH: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
-    """
-    Build context for scene analysis prompt.
+    """Build context for scene analysis prompt."""
+    if brick_size_LWH is None:
+        brick_size_LWH = DEFAULT_BRICK_SIZE_LWH
     
-    Args:
-        detected_bricks: List of detected brick info, each with:
-            - position: [x, y, z] in base_link frame
-            - (optional) yaw: orientation
-        target_position: [x, y, z] target placement position
-        placed_count: Number of bricks already placed
-        initial_brick_count: Initial number of bricks (if known)
-        proximity_threshold: Distance threshold for "at target" (meters)
-        brick_height: Single brick height (meters)
-        stack_increment: Height increment per stacked brick (meters)
-    
-    Returns:
-        Context dictionary for prompt builder
-    """
     target_xy = target_position[:2] if len(target_position) >= 2 else [0.54, -0.04]
     
-    # Calculate distance to target for each brick, PRESERVE original index
+    # Enrich brick data
     enriched_bricks = []
     for i, brick in enumerate(detected_bricks):
         pos = brick.get('position', [0, 0, 0])
+        if hasattr(pos, 'tolist'):
+            pos = pos.tolist()
+        
         dx = pos[0] - target_xy[0]
         dy = pos[1] - target_xy[1]
         distance = math.sqrt(dx*dx + dy*dy)
         
+        z_height = brick.get('z_height', pos[2])
+        
+        # 优先使用已计算的 relative_height
+        relative_height = brick.get('relative_height', None)
+        if relative_height is None:
+            relative_height = z_height - ground_z
+        
         enriched_bricks.append({
-            'original_index': i,  # 保留原始索引！
+            'original_index': i,
             'position': pos,
             'yaw': brick.get('yaw', 0),
+            'area_cm2': brick.get('area_cm2', 55.0),
+            'area_pixels': brick.get('area_pixels', 0),
+            'z_height': z_height,
+            'relative_height': relative_height,
             'distance_to_target': distance,
-            'at_target': distance < proximity_threshold,  # 明确标记是否在目标位置
+            'at_target': distance < proximity_threshold,
         })
     
-    # Sort by distance (farthest first) but keep original_index
-    enriched_bricks.sort(key=lambda b: b['distance_to_target'], reverse=True)
+    # Sort by rel_h descending (highest first) - helps see stacking
+    enriched_bricks.sort(key=lambda b: b['relative_height'], reverse=True)
     
     if initial_brick_count is None:
         initial_brick_count = len(detected_bricks) + placed_count
@@ -305,4 +385,7 @@ def build_scene_analysis_context(
         "proximity_threshold": proximity_threshold,
         "brick_height": brick_height,
         "stack_increment": stack_increment,
+        "normal_brick_area_cm2": normal_brick_area_cm2,
+        "ground_z": ground_z,
+        "brick_size_LWH": brick_size_LWH,
     }

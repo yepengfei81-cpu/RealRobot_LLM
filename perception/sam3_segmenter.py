@@ -128,9 +128,10 @@ class SAM3Segmenter:
         color: tuple = (0, 255, 0),
         thickness: int = 2,
         selected_index: Optional[int] = None,
+        draw_contour: bool = True,
     ) -> np.ndarray:
         """
-        Draw detection bounding box on frame.
+        Draw detection on frame.
         
         Args:
             frame: BGR image to draw on
@@ -138,6 +139,7 @@ class SAM3Segmenter:
             color: box color (BGR) for selected/single detection
             thickness: line thickness
             selected_index: if provided, highlight this mask specially (others drawn dimmer)
+            draw_contour: if True, draw actual contour; if False, draw minAreaRect
             
         Returns:
             Frame with detection visualization
@@ -160,16 +162,13 @@ class SAM3Segmenter:
         
         # Handle single vs multiple masks
         if len(mask.shape) == 2:
-            # Single 2D mask
             masks_list = [mask]
         elif len(mask.shape) == 3:
-            # Multiple masks: (N, H, W) or single (1, H, W)
             if mask.shape[0] == 1:
                 masks_list = [mask[0]]
             else:
                 masks_list = [mask[i] for i in range(mask.shape[0])]
         elif len(mask.shape) == 4:
-            # Shape like (N, 1, H, W)
             masks_list = [mask[i, 0] for i in range(mask.shape[0])]
         else:
             return result
@@ -192,24 +191,26 @@ class SAM3Segmenter:
             # Determine color and thickness for this mask
             if selected_index is not None:
                 if i == selected_index:
-                    # Selected brick: bright color, thick line
                     draw_color = (0, 255, 0)  # Bright green
                     draw_thickness = 3
                 else:
-                    # Non-selected: dimmer color, thin line
                     draw_color = (100, 100, 100)  # Gray
                     draw_thickness = 1
             else:
-                # No selection: show all with different colors
                 draw_color = colors[i % len(colors)]
                 draw_thickness = thickness
             
-            # Draw oriented bounding box
-            if len(largest) >= 5:
-                rect = cv2.minAreaRect(largest)
-                box = cv2.boxPoints(rect)
-                box = np.int0(box)
-                cv2.drawContours(result, [box], 0, draw_color, draw_thickness)
+            # Draw contour or bounding box
+            if draw_contour:
+                # 绘制实际轮廓 - 与 test_brick_anomaly 一致
+                cv2.drawContours(result, [largest], -1, draw_color, draw_thickness)
+            else:
+                # 绘制最小外接矩形
+                if len(largest) >= 5:
+                    rect = cv2.minAreaRect(largest)
+                    box = cv2.boxPoints(rect)
+                    box = np.int0(box)
+                    cv2.drawContours(result, [box], 0, draw_color, draw_thickness)
             
             # Draw center point and index
             M = cv2.moments(largest)
@@ -220,7 +221,7 @@ class SAM3Segmenter:
                 # Center point
                 if selected_index is None or i == selected_index:
                     cv2.circle(result, (cx, cy), 5, draw_color, -1)
-                    # Draw index number
+                    cv2.circle(result, (cx, cy), 7, (255, 255, 255), 2)
                     cv2.putText(result, f"#{i}", (cx + 10, cy - 10), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2)
                 else:

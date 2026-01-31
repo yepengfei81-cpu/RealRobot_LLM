@@ -2,7 +2,7 @@
 Position Calculators for Brick Detection
 
 Provides geometric calculations for:
-- Head camera: Convert depth + mask to 3D position
+- Head camera: Convert depth + mask to 3D position + area
 - Hand-eye camera: Fine positioning with known reference
 """
 
@@ -131,17 +131,75 @@ def estimate_orientation(mask: np.ndarray) -> float:
     return float(np.clip(yaw, -np.pi / 2, np.pi / 2))
 
 
+def calculate_real_area(
+    mask: np.ndarray, 
+    depth: np.ndarray, 
+    fx: float, 
+    fy: float
+) -> Tuple[float, int]:
+    """
+    Calculate real-world area of a segmented region.
+    
+    Uses depth and camera intrinsics to estimate actual area.
+    
+    Args:
+        mask: binary mask (H, W) or boolean mask
+        depth: depth image in mm
+        fx: camera focal length x
+        fy: camera focal length y
+        
+    Returns:
+        Tuple of (area_cm2, area_pixels)
+    """
+    # Ensure mask is boolean
+    mask_bool = mask > 0.5 if mask.dtype != bool else mask
+    
+    # Get pixel count
+    pixel_count = int(np.sum(mask_bool))
+    
+    if pixel_count == 0:
+        return 0.0, 0
+    
+    # Get valid depth values in mask region
+    valid_depth = depth[mask_bool]
+    valid_depth = valid_depth[(valid_depth > 100) & (valid_depth < 2000)]  # 10cm - 2m in mm
+    
+    if len(valid_depth) == 0:
+        return 0.0, pixel_count
+    
+    # Use median depth for robustness
+    median_depth_m = np.median(valid_depth) / 1000.0  # Convert to meters
+    
+    # Calculate pixel size at this depth
+    # At depth z, each pixel covers (z/fx) × (z/fy) meters
+    pixel_size_m2 = (median_depth_m / fx) * (median_depth_m / fy)
+    
+    # Calculate area
+    area_m2 = pixel_count * pixel_size_m2
+    area_cm2 = area_m2 * 10000  # Convert to cm²
+    
+    return area_cm2, pixel_count
+
+
 # ==================== Head Camera Calculator ====================
 
 class HeadCameraCalculator:
     """
     Head Camera Position Calculator
     
-    Computes brick position in base_link frame from:
+    Computes brick information in base_link frame from:
     - Segmentation mask
     - Depth image
     - Camera TF transform
     - Dynamic Z compensation
+    
+    Returns:
+    - position: [x, y, z] in base_link frame
+    - yaw: orientation angle
+    - area_cm2: estimated real area in cm²
+    - area_pixels: pixel count
+    - z_compensation: applied Z offset
+    - depth_median_m: median depth value
     """
     
     def __init__(
@@ -192,7 +250,7 @@ class HeadCameraCalculator:
         tf_matrix: np.ndarray
     ) -> Optional[Dict]:
         """
-        Compute brick position in base_link frame.
+        Compute brick information in base_link frame.
         
         Args:
             mask: segmentation mask
@@ -200,7 +258,15 @@ class HeadCameraCalculator:
             tf_matrix: 4x4 transform from camera to base_link
             
         Returns:
-            Dictionary with 'position', 'yaw', and 'z_compensation' or None if failed
+            Dictionary with:
+            - 'position': [x, y, z] in base_link frame
+            - 'yaw': orientation angle (radians)
+            - 'area_cm2': estimated real area in cm²
+            - 'area_pixels': pixel count of mask
+            - 'z_compensation': applied Z offset
+            - 'depth_median_m': median depth value in meters
+            
+            Returns None if computation failed
         """
         h, w = depth.shape
         
@@ -233,7 +299,13 @@ class HeadCameraCalculator:
             return None
         
         z = np.median(valid) / 1000.0  # Convert to meters
+        depth_median_m = z  # Save for return
         z = np.clip(z, 0.1, 2.0)
+        
+        # ========== Calculate Real Area ==========
+        area_cm2, area_pixels = calculate_real_area(
+            mask_bool, depth, self.fx, self.fy
+        )
         
         # Compute 3D position in camera frame
         pos_cam = np.array([
@@ -264,7 +336,10 @@ class HeadCameraCalculator:
         return {
             'position': pos_base, 
             'yaw': yaw_base,
+            'area_cm2': area_cm2,
+            'area_pixels': area_pixels,
             'z_compensation': z_compensation,
+            'depth_median_m': depth_median_m,
         }
 
 

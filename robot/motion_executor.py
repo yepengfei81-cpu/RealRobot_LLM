@@ -291,9 +291,6 @@ class GraspPlaceExecutor:
         self._save_result('handeye', handeye_result)
         fine_pos = handeye_result['position']
         fine_yaw = handeye_result['yaw']
-        
-        # 关键修复：使用头部相机的 Z 值（已含动态补偿），而不是手眼相机计算的 Z
-        # 手眼相机只用于精调 XY，Z 值沿用头部相机的结果
         fine_pos_corrected = np.array([fine_pos[0], fine_pos[1], reference_z])
         
         print(f"  Hand-eye XY: [{fine_pos[0]:.4f}, {fine_pos[1]:.4f}]")
@@ -476,9 +473,16 @@ class GraspPlaceExecutor:
     def move_to_place(
         self,
         grasp_yaw: float,
+        custom_place_position: Optional[List[float]] = None,
+        custom_place_yaw: Optional[float] = None,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Move to place position (XY only, keep Z).
+        
+        Args:
+            grasp_yaw: Current TCP yaw angle
+            custom_place_position: Custom [x, y, z] position (for anomaly removal)
+            custom_place_yaw: Custom yaw angle (optional)
         
         Returns:
             Tuple of (success, result_dict, error_message)
@@ -492,23 +496,30 @@ class GraspPlaceExecutor:
             return False, None, "Cannot get TCP position"
         tcp_pos_list = tcp_pos.tolist()
         
-        # Plan move to place with LLM
-        success, move_result, error = self.llm_planner.plan_move_to_place(
-            tcp_position=tcp_pos_list,
-            tcp_yaw=grasp_yaw,
-        )
-        
-        if not success:
-            print(f"  [Warning] LLM move_to_place failed: {error}")
-            # Fallback: use config target position directly
-            place_config = self.llm_planner.config.get("place", {})
-            place_pos = list(place_config.get("target_position", [0.54, -0.04, tcp_pos_list[2]]))
-            place_yaw = place_config.get("target_yaw", 0.0)
-            place_pos[2] = tcp_pos_list[2]  # Keep current Z
+        # Use custom position if provided (for anomaly removal)
+        if custom_place_position is not None:
+            place_pos = list(custom_place_position)
+            place_pos[2] = tcp_pos_list[2]  # Keep current Z (lifted height)
+            place_yaw = custom_place_yaw if custom_place_yaw is not None else grasp_yaw
+            print(f"  Using custom place position: [{place_pos[0]:.4f}, {place_pos[1]:.4f}, {place_pos[2]:.4f}] m")
         else:
-            place_pos = move_result['target_position']
-            place_yaw = move_result['target_yaw']
-            print(f"  Move target: [{place_pos[0]:.4f}, {place_pos[1]:.4f}, {place_pos[2]:.4f}] m, yaw={np.degrees(place_yaw):.1f}°")
+            # Plan move to place with LLM (normal stacking)
+            success, move_result, error = self.llm_planner.plan_move_to_place(
+                tcp_position=tcp_pos_list,
+                tcp_yaw=grasp_yaw,
+            )
+            
+            if not success:
+                print(f"  [Warning] LLM move_to_place failed: {error}")
+                # Fallback: use config target position directly
+                place_config = self.llm_planner.config.get("place", {})
+                place_pos = list(place_config.get("target_position", [0.54, -0.04, tcp_pos_list[2]]))
+                place_yaw = place_config.get("target_yaw", 0.0)
+                place_pos[2] = tcp_pos_list[2]  # Keep current Z
+            else:
+                place_pos = move_result['target_position']
+                place_yaw = move_result['target_yaw']
+                print(f"  Move target: [{place_pos[0]:.4f}, {place_pos[1]:.4f}, {place_pos[2]:.4f}] m, yaw={np.degrees(place_yaw):.1f}°")
         
         # Execute move to place
         if not self.robot_env.move_arm(place_pos, place_yaw, wait=3.0, check_abort=self._check_abort):
@@ -534,6 +545,9 @@ class GraspPlaceExecutor:
         Uses two contact detection methods:
         1. Z position error (z_error > threshold_mm)
         2. Arm effort (total arm current > effort_threshold)
+        
+        IMPORTANT: Real-time effort protection is implemented BEFORE LLM call
+        to prevent damage from LLM response delay.
         
         Args:
             place_yaw: Yaw angle for placement
@@ -583,7 +597,6 @@ class GraspPlaceExecutor:
         print("\n  === Closed-Loop Placement ===")
         print("  Detecting surface contact via Z position error AND arm effort...")
         
-        # ========== 从配置文件读取参数 ==========
         release_config = self.llm_planner.config.get("release", {})
         max_release_attempts = release_config.get("max_attempts", 10)
         contact_threshold_mm = release_config.get("contact_threshold_mm", 0.8)
@@ -609,8 +622,7 @@ class GraspPlaceExecutor:
             target_z = current_place_pos[2]
             z_error = actual_z - target_z
             z_error_mm = z_error * 1000
-            
-            # 获取整臂电流
+    
             arm_effort = self.robot_env.get_arm_total_effort()
             arm_effort_str = f"{arm_effort:.2f}A" if arm_effort is not None else "N/A"
             
@@ -618,15 +630,16 @@ class GraspPlaceExecutor:
             print(f"  Actual Z: {actual_z:.4f} m, Target Z: {target_z:.4f} m, Error: {z_error_mm:+.1f} mm")
             print(f"  Arm total effort: {arm_effort_str}")
             
-            # ========== 优先检查电流阈值 ==========
+            # ========== (BEFORE LLM) ==========
             if arm_effort is not None and arm_effort > arm_effort_threshold:
-                print(f"  ✓ ARM EFFORT EXCEEDED ({arm_effort:.2f}A > {arm_effort_threshold:.1f}A)")
-                print(f"    Lifting {lift_step*1000:.1f} mm before release...")
+                print(f"  ⚠️ REAL-TIME EFFORT PROTECTION TRIGGERED!")
+                print(f"     Effort {arm_effort:.2f}A > threshold {arm_effort_threshold:.1f}A")
+                print(f"     Lifting {lift_step*1000:.1f} mm immediately before release...")
+                
                 current_place_pos[2] += lift_step
-                self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
+                self.robot_env.move_arm(current_place_pos, place_yaw, wait=0.5, check_abort=self._check_abort)
                 break
             
-            # ========== LLM 分析 release feedback ==========
             success, release_result, error = self.llm_planner.analyze_release_feedback(
                 actual_z=actual_z,
                 target_z=target_z,
@@ -641,31 +654,24 @@ class GraspPlaceExecutor:
             
             if not success:
                 print(f"  [Warning] LLM release analysis failed: {error}")
-                # Fallback: 检查 Z 误差或电流
-                if z_error_mm > contact_threshold_mm:
-                    print("  [Fallback] Z contact detected, releasing...")
-                    current_place_pos[2] += lift_step
-                    self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
-                    break
-                else:
-                    current_place_pos[2] -= descend_step
-                    self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
-                    continue
+                current_place_pos[2] -= descend_step
+                self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
+                continue
             
             action = release_result['action']
             action_type = action['type']
             delta_z = action['delta_z']
             
             if action_type == 'release':
-                print("  ✓ Contact detected, releasing immediately!")
+                print("  ✓ LLM: Contact detected, releasing immediately!")
                 break
             elif action_type == 'lift_then_release':
-                print(f"  ✓ Pressing detected, lifting {delta_z*1000:.1f} mm before release...")
+                print(f"  ✓ LLM: Pressing detected, lifting {delta_z*1000:.1f} mm before release...")
                 current_place_pos[2] += delta_z
                 self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort)
                 break
             elif action_type == 'descend':
-                print(f"  → No contact, descending {abs(delta_z)*1000:.1f} mm...")
+                print(f"  → LLM: No contact, descending {abs(delta_z)*1000:.1f} mm...")
                 current_place_pos[2] += delta_z
                 if not self.robot_env.move_arm(current_place_pos, place_yaw, wait=1.0, check_abort=self._check_abort):
                     print("  [Warning] Descend move failed")
@@ -698,6 +704,9 @@ class GraspPlaceExecutor:
         depth: np.ndarray,
         target_surface_z: Optional[float] = None,
         brick_index: int = 0,
+        custom_place_position: Optional[List[float]] = None,
+        custom_place_yaw: Optional[float] = None,
+        is_anomaly_removal: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Execute a complete grasp-place cycle.
@@ -709,12 +718,16 @@ class GraspPlaceExecutor:
             depth: Depth image from head camera
             target_surface_z: Target Z height for placement (if None, use config)
             brick_index: Which brick to grasp (if multiple detected)
+            custom_place_position: Custom [x, y, z] for placement (for anomaly removal)
+            custom_place_yaw: Custom yaw for placement (optional)
+            is_anomaly_removal: If True, prints anomaly removal messages
             
         Returns:
             Tuple of (success, error_message)
         """
+        task_type = "Anomaly Removal" if is_anomaly_removal else "LLM Grasp-Place"
         print("\n" + "=" * 60)
-        print("[Task Started] LLM Grasp-Place with DynamicZCompensator")
+        print(f"[Task Started] {task_type} with DynamicZCompensator")
         print("=" * 60)
         
         # Step 1: Head camera detection (includes DynamicZCompensator)
@@ -739,10 +752,9 @@ class GraspPlaceExecutor:
             return False, error
         
         # Step 4: Hand-eye fine positioning
-        # 关键：传入 z_compensation，并且使用 brick_pos[2]（已含补偿）作为 reference_z
         reference_xy = [brick_pos_list[0], brick_pos_list[1]]
         success, fine_result, error = self.fine_position_with_handeye(
-            reference_z=brick_pos_list[2],  # 头部相机的 Z（已含动态补偿）
+            reference_z=brick_pos_list[2],
             reference_yaw=brick_yaw,
             reference_xy=reference_xy,
             z_compensation=z_compensation,
@@ -758,7 +770,7 @@ class GraspPlaceExecutor:
         print(f"  Position: {fine_pos_list}")
         print(f"  Z (from head camera with compensation): {fine_pos_list[2]:.4f} m")
         
-        # Step 5-6: Grasp (uses Z compensation from head camera)
+        # Step 5-6: Grasp
         success, grasp_result, error = self.execute_grasp(
             fine_pos_list, float(fine_yaw), z_compensation
         )
@@ -772,17 +784,31 @@ class GraspPlaceExecutor:
         if not success:
             return False, error
         
-        # Step 8: Move to place
-        success, move_result, error = self.move_to_place(grasp_yaw)
+        # Step 8: Move to place (use custom position if provided)
+        success, move_result, error = self.move_to_place(
+            grasp_yaw,
+            custom_place_position=custom_place_position,
+            custom_place_yaw=custom_place_yaw,
+        )
         if not success:
             return False, error
         
         place_yaw = move_result['place_yaw']
         
         # Step 9-10: Place and release
+        # For anomaly removal, use current brick's Z as target surface
+        if is_anomaly_removal and target_surface_z is None:
+            # Use a safe height for placing removed bricks
+            target_surface_z = brick_pos_list[2]  # Same height as where we picked it
+        
         success, _, error = self.execute_place_and_release(place_yaw, target_surface_z)
         if not success:
             return False, error
+        
+        if is_anomaly_removal:
+            print("\n" + "=" * 60)
+            print("[Anomaly Removal Complete] Brick moved to safe location")
+            print("=" * 60)
         
         return True, None
 

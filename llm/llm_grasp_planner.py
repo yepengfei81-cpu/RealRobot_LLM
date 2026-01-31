@@ -1000,36 +1000,41 @@ class LLMGraspPlanner:
         placed_count: int = 0,
         initial_brick_count: Optional[int] = None,
         proximity_threshold: float = 0.08,
+        normal_brick_area_cm2: float = 45.0,
+        ground_z: float = 0.86,
+        brick_size_LWH: Optional[List[float]] = None,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
-        Analyze scene for multi-brick stacking task.
+        Analyze scene for multi-brick stacking task with anomaly detection.
         
         Args:
             detected_bricks: List of detected brick info, each with:
                 - position: [x, y, z] in base_link frame
                 - yaw: orientation (optional)
+                - area_cm2: estimated real area in cm² (REQUIRED for anomaly detection)
+                - area_pixels: pixel area (optional)
+                - z_height: Z height in base_link frame (optional)
             target_position: [x, y, z] target placement position
             placed_count: Number of bricks already placed
             initial_brick_count: Initial number of bricks (if known)
             proximity_threshold: Distance threshold for "at target" (meters)
+            normal_brick_area_cm2: Minimum area for visible brick (cm²)
+            ground_z: Estimated ground Z height (meters)
+            brick_size_LWH: Brick dimensions [L, W, H] in meters
             
         Returns:
             Tuple of (success, result_dict, error_message)
-            
-            result_dict contains:
-            - task_complete: bool
-            - confidence: float
-            - scene_state: {total_bricks_detected, bricks_at_target, bricks_to_grasp, estimated_stack_height}
-            - next_action: {type, target_brick_index, reason}
-            - analysis: {target_area_status, completion_criteria_met, reasoning}
         """
         from .prompts import get_scene_analysis_prompt, build_scene_analysis_context
         
         # Get brick config
-        brick_height = self.brick_config.get("size_LWH", [0.11, 0.05, 0.025])[2]
+        if brick_size_LWH is None:
+            brick_size_LWH = self.brick_config.get("size_LWH", [0.11, 0.05, 0.025])
+        
+        brick_height = brick_size_LWH[2]
         stack_increment = brick_height + 0.003  # 3mm margin
         
-        # Build context
+        # Build context with area info and new parameters
         context = build_scene_analysis_context(
             detected_bricks=detected_bricks,
             target_position=target_position,
@@ -1038,19 +1043,13 @@ class LLMGraspPlanner:
             proximity_threshold=proximity_threshold,
             brick_height=brick_height,
             stack_increment=stack_increment,
+            normal_brick_area_cm2=normal_brick_area_cm2,
+            ground_z=ground_z,
+            brick_size_LWH=brick_size_LWH,
         )
         
         # Generate prompt
         system_prompt, user_prompt = get_scene_analysis_prompt(context)
-        
-        # Debug: print prompt if enabled
-        if self.debug_config.get("print_llm_prompt", False):
-            print("\n" + "=" * 60)
-            print("[LLM Scene Analysis Prompt - System]")
-            print(system_prompt)
-            print("\n[LLM Scene Analysis Prompt - User]")
-            print(user_prompt)
-            print("=" * 60 + "\n")
         
         # Call LLM
         success, response, error = self.llm_client.chat_json(system_prompt, user_prompt)
@@ -1064,7 +1063,7 @@ class LLMGraspPlanner:
             self._print_scene_analysis_summary(response)
         
         # Parse response
-        result = self._parse_scene_analysis_response(response, len(detected_bricks))
+        result = self._parse_scene_analysis_response(response, len(detected_bricks), detected_bricks)
         
         if result is None:
             return False, None, "Failed to parse LLM scene analysis response"
@@ -1075,68 +1074,127 @@ class LLMGraspPlanner:
         """Print scene analysis summary."""
         task_complete = response.get("task_complete", False)
         confidence = response.get("confidence", 0.0)
+        anomaly_detected = response.get("anomaly_detected", False)
         scene_state = response.get("scene_state", {})
         next_action = response.get("next_action", {})
+        bricks_status = response.get("bricks_status", [])
         analysis = response.get("analysis", {})
         
         total = scene_state.get("total_bricks_detected", 0)
         at_target = scene_state.get("bricks_at_target", 0)
         to_grasp = scene_state.get("bricks_to_grasp", 0)
+        stacked_count = scene_state.get("stacked_anomaly_count", 0)
+        pose_anomaly_count = scene_state.get("pose_anomaly_count", 0)
+        occluded_count = scene_state.get("occluded_count", 0)
         
         status = "✓ COMPLETE" if task_complete else "→ IN PROGRESS"
+        anomaly_str = "⚠️ ANOMALY DETECTED" if anomaly_detected else "✓ No anomaly"
+        
         print(f"  [LLM Scene] {status} (confidence: {confidence:.2f})")
+        print(f"  [LLM Scene] {anomaly_str}")
         print(f"  [LLM Scene] Bricks: {total} total, {at_target} at target, {to_grasp} to grasp")
         
+        if anomaly_detected:
+            print(f"  [LLM Scene] Stacked: {stacked_count}, Pose anomaly: {pose_anomaly_count}, Occluded: {occluded_count}")
+        
+        # ===== Print each brick's status =====
+        if bricks_status:
+            print(f"\n  [LLM Scene] === Brick Status ===")
+            for bs in bricks_status:
+                idx = bs.get("index", "?")
+                pose = bs.get("pose", "unknown")
+                status_str = bs.get("status", "unknown")
+                graspable = bs.get("graspable", False)
+                reasoning = bs.get("reasoning", "")
+                
+                # Pose icons
+                pose_icon = {
+                    "flat": "▬",
+                    "side": "⟂",
+                    "upright": "↑",
+                    "stacked_upper": "⊞↑",
+                    "stacked_lower": "⊞↓",
+                }.get(pose, "?")
+                
+                grasp_str = "✓" if graspable else "✗"
+                print(f"    Brick {idx}: {pose_icon} {pose:<14} | {status_str:<16} | grasp={grasp_str} | {reasoning[:60]}")
+            print()
+        
         action_type = next_action.get("type", "unknown")
-        if action_type == "grasp":
-            idx = next_action.get("target_brick_index", -1)
+        idx = next_action.get("target_brick_index", -1)
+        place_pos = next_action.get("place_position")
+        
+        if action_type == "remove_anomaly":
+            print(f"  [LLM Scene] Next: REMOVE ANOMALY - brick #{idx}")
+            if place_pos:
+                print(f"  [LLM Scene] Place at: [{place_pos[0]:.3f}, {place_pos[1]:.3f}, {place_pos[2]:.3f}]")
+        elif action_type == "grasp":
             print(f"  [LLM Scene] Next: Grasp brick #{idx}")
         elif action_type == "complete":
             print(f"  [LLM Scene] Next: Task complete!")
         else:
             print(f"  [LLM Scene] Next: {action_type} - {next_action.get('reason', 'N/A')}")
-    
+
     def _parse_scene_analysis_response(
         self, 
         response: Dict,
         num_detected: int,
+        detected_bricks: Optional[List[Dict]] = None,
     ) -> Optional[Dict]:
-        """Parse LLM response for scene analysis."""
+        """Parse LLM response for scene analysis with anomaly detection."""
         try:
             task_complete = response.get("task_complete", False)
             confidence = response.get("confidence", 0.0)
+            anomaly_detected = response.get("anomaly_detected", False)
             scene_state = response.get("scene_state", {})
             next_action = response.get("next_action", {})
+            bricks_status = response.get("bricks_status", [])
             analysis = response.get("analysis", {})
             
             action_type = next_action.get("type", "error")
             target_idx = next_action.get("target_brick_index")
+            place_position = next_action.get("place_position")
             
             # Validate target_brick_index
-            if action_type == "grasp":
+            if action_type in ["grasp", "remove_anomaly"]:
                 if target_idx is None or not isinstance(target_idx, int):
-                    self._log("Warning: grasp action but no valid target_brick_index")
-                    # Try to find a valid brick (first one away from target)
-                    target_idx = 0 if num_detected > 0 else None
+                    self._log("Error: action requires target_brick_index but none provided")
+                    return None
                 elif target_idx < 0 or target_idx >= num_detected:
-                    self._log(f"Warning: target_brick_index {target_idx} out of range [0, {num_detected})")
-                    target_idx = 0 if num_detected > 0 else None
+                    self._log(f"Error: target_brick_index {target_idx} out of range [0, {num_detected})")
+                    return None
+            
+            # Validate place_position for remove_anomaly - NO FALLBACK, trust LLM completely
+            if action_type == "remove_anomaly":
+                if place_position is None or len(place_position) != 3:
+                    self._log("Error: remove_anomaly requires place_position but LLM didn't provide valid one")
+                    return None
+                # Ensure it's a list of floats
+                place_position = [float(p) for p in place_position]
             
             return {
                 "task_complete": bool(task_complete),
                 "confidence": float(np.clip(confidence, 0.0, 1.0)),
+                "anomaly_detected": bool(anomaly_detected),
                 "scene_state": {
                     "total_bricks_detected": int(scene_state.get("total_bricks_detected", num_detected)),
                     "bricks_at_target": int(scene_state.get("bricks_at_target", 0)),
                     "bricks_to_grasp": int(scene_state.get("bricks_to_grasp", num_detected)),
+                    "stacked_anomaly_count": int(scene_state.get("stacked_anomaly_count", 0)),
+                    "pose_anomaly_count": int(scene_state.get("pose_anomaly_count", 0)),
+                    "occluded_count": int(scene_state.get("occluded_count", 0)),
                     "estimated_stack_height": int(scene_state.get("estimated_stack_height", 0)),
                 },
                 "next_action": {
                     "type": action_type,
                     "target_brick_index": target_idx,
+                    "place_position": place_position,
                     "reason": next_action.get("reason", ""),
                 },
+                "bricks_status": bricks_status,
                 "analysis": {
+                    "pose_analysis": analysis.get("pose_analysis", ""),
+                    "anomaly_analysis": analysis.get("anomaly_analysis", ""),
                     "target_area_status": analysis.get("target_area_status", "unknown"),
                     "completion_criteria_met": analysis.get("completion_criteria_met", False),
                     "reasoning": analysis.get("reasoning", ""),
@@ -1146,7 +1204,8 @@ class LLMGraspPlanner:
             
         except Exception as e:
             self._log(f"Error parsing scene analysis response: {e}")
-            return None        
+            return None
+        
 # ==================== Factory Function ====================
 
 def create_grasp_planner(config_path: Optional[str] = None) -> LLMGraspPlanner:

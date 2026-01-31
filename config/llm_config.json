@@ -6,7 +6,7 @@
     "temperature": 0.0,
     "api_key": "sk-a1b0fd7f25054e008406d3c9cf71ddf9",
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "timeout": 15.0,
+    "timeout": 30.0,
     "max_retries": 2
   },
 
@@ -42,7 +42,7 @@
     "contact_threshold_mm": 1.2,
     "descend_step": 0.007,
     "lift_step": 0.005,
-    "arm_effort_threshold": 11.5
+    "arm_effort_threshold": 12.0
   },
 
   "timing": {
